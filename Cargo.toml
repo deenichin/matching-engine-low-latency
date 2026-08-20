@@ -1,6 +1,15 @@
-[package]
-name = "onebalance-task"
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/wire",
+    "crates/risk",
+    "crates/gateway",
+    "crates/marketdata",
+    "crates/bin",
+    "crates/bench",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-
-[dependencies]

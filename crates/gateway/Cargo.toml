@@ -1,0 +1,9 @@
+[package]
+name = "gateway"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+core = { path = "../core" }
+wire = { path = "../wire" }
+risk = { path = "../risk" }

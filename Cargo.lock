@@ -3,5 +3,44 @@
 version = 4
 
 [[package]]
-name = "onebalance-task"
+name = "bench"
 version = "0.1.0"
+
+[[package]]
+name = "bin"
+version = "0.1.0"
+
+[[package]]
+name = "core"
+version = "0.1.0"
+
+[[package]]
+name = "gateway"
+version = "0.1.0"
+dependencies = [
+ "core",
+ "risk",
+ "wire",
+]
+
+[[package]]
+name = "marketdata"
+version = "0.1.0"
+dependencies = [
+ "core",
+ "wire",
+]
+
+[[package]]
+name = "risk"
+version = "0.1.0"
+dependencies = [
+ "core",
+]
+
+[[package]]
+name = "wire"
+version = "0.1.0"
+dependencies = [
+ "core",
+]

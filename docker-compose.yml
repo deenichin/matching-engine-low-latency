@@ -1,5 +1,13 @@
 services:
-  app:
+  engine:
     build: .
     image: onebalance-task:local
     container_name: onebalance-task
+    volumes:
+      # Shared home for both UDS sockets (SPEC.md §3):
+      #   /run/engine/order-entry.sock
+      #   /run/engine/market-data.sock
+      - engine-sockets:/run/engine
+
+volumes:
+  engine-sockets:

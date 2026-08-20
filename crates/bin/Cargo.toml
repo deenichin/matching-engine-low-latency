@@ -1,0 +1,10 @@
+[package]
+name = "bin"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "engine"
+path = "src/main.rs"
+
+[dependencies]

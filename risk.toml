@@ -1,0 +1,6 @@
+# Default risk-control configuration (SPEC.md §5). Baked in so
+# `docker compose up` needs no setup.
+
+max_open_orders = 50
+max_notional_ticks = 100_000_000
+price_band_pct = 10
