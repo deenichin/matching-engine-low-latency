@@ -702,7 +702,11 @@ Documented as such in the README.
 ## 7. Deterministic replay
 
 Given the same ordered input stream, output must be byte-identical: execution
-reports and market data, including sequence numbers.
+reports and market data, including sequence numbers. This "byte-identical"
+guarantee is defined over the outbound event stream specifically — any
+`Book`-internal state with no direct event-stream representation (currently:
+`last_trade`) is not covered by an outbound-stream comparison alone and needs
+its own explicit verification in stage 6's design.
 
 - No wall-clock in the matching core
 - No `HashMap` iteration order reaching output

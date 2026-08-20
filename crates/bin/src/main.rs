@@ -1,13 +1,20 @@
-//! The daemon. Wires `gateway`'s order-entry and matching threads
-//! together (SPEC §4). `risk` and `marketdata` join in stages 4 and 5.
+//! The daemon. Wires `gateway`'s order-entry and matching threads, and
+//! `risk`'s state, together (SPEC §4). `marketdata` joins in stage 5.
 
 use std::path::Path;
 use std::sync::mpsc;
 
 use gateway::{Transport, UdsTransport, run_matching_thread, run_order_entry};
+use risk::{RiskConfig, RiskState};
 
 /// Order-entry socket path (SPEC §3).
 const ORDER_ENTRY_SOCKET: &str = "/run/engine/order-entry.sock";
+
+/// Risk config path (SPEC §5), relative to the daemon's working
+/// directory — `/home/app/risk.toml` in the Docker image ("no host setup
+/// required"), the repo root when run locally. Missing entirely still
+/// works: `RiskConfig::load` falls back to the SPEC §5 defaults.
+const RISK_CONFIG_PATH: &str = "risk.toml";
 
 /// Placeholder channel capacities. Bounded and pre-allocated, per
 /// CLAUDE.md — the actual numbers are a stage 7 benchmarking concern, not
@@ -29,6 +36,9 @@ fn main() {
         }
     };
 
+    let risk_config = RiskConfig::load(Path::new(RISK_CONFIG_PATH));
+    let risk_state = RiskState::new(risk_config);
+
     let (command_tx, command_rx) = mpsc::sync_channel(COMMAND_CHANNEL_CAPACITY);
     let (return_tx, return_rx) = mpsc::sync_channel(RETURN_CHANNEL_CAPACITY);
     // Stage 5 stub: nothing drains this yet (SPEC §4 -- the market data
@@ -40,10 +50,19 @@ fn main() {
 
     let return_tx_for_matching = return_tx.clone();
     let matching_handle = std::thread::spawn(move || {
-        run_matching_thread(command_rx, return_tx_for_matching, market_data_tx)
+        run_matching_thread(
+            command_rx,
+            return_tx_for_matching,
+            market_data_tx,
+            risk_state,
+        )
     });
 
     println!("matching-engine: listening on {}", path.display());
+    println!(
+        "matching-engine: risk config max_open_orders={} max_notional={} price_band_pct={}",
+        risk_config.max_open_orders, risk_config.max_notional, risk_config.price_band_pct
+    );
 
     // The order-entry accept loop is the blocking call that keeps the
     // process alive; it only returns once the transport's listener stops

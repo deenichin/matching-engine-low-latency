@@ -223,6 +223,26 @@ streams`.
 5. Determinism property test over the full operation set, mass-cancel included
 6. Concurrent-submission priority test: multiple client threads over real
    sockets, asserting fills reflect strict arrival order at the matcher
+7. **`last_trade` (and any other `Book`-internal state with no direct
+   event-stream representation) needs its own explicit replay verification,
+   decided before this stage is built, not after.** A byte-identical
+   outbound-events comparison does not by itself prove `last_trade` replayed
+   correctly — it can diverge silently if nothing in the recorded sequence
+   exercises a path that reads it. Two approaches: compare `last_trade` (and
+   any other such state) directly, not just the outbound stream; or build the
+   operation set so every `last_trade`-dependent branch is guaranteed to
+   produce an observable, divergence-sensitive event. State which one this
+   stage takes before implementing it.
+8. **The determinism property test's operation set must deliberately include
+   a Market order or price-banded order submitted after at least one trade
+   has occurred**, specifically to exercise the `last_trade` branch of both
+   the price-band and Market-notional resolution, not just their
+   depth-based fallback paths. Being "in the op set" is not enough --
+   `quantity_conservation`'s op set already includes `Market` and never
+   exercised `RiskState` at all, since `RiskState` didn't exist when that
+   test was written (stage 1, before stage 4). The op set has to reach the
+   specific branch being tested, not merely include the command type that
+   could reach it.
 
 Ship a recorded stream and the replay command in the repo.
 

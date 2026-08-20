@@ -109,6 +109,11 @@ fn event_id(event: &Event) -> Option<(AccountId, OrderId)> {
 /// `command_rx` disconnects (every sender dropped) — the orderly shutdown
 /// path; there is no other exit.
 ///
+/// `risk_state` is checked before every `Engine::apply` call, inside this
+/// loop — not at ingress — so a command already sitting in the channel
+/// when the kill switch fires is still checked against the new state
+/// (SPEC §5). It is `&mut` because a `KillSwitch` command updates it.
+///
 /// `market_data_tx` is stage 5's channel, stubbed here: `Trade` and
 /// `BookUpdate` events get routed to it via `try_send` (never blocking,
 /// since nothing consumes it yet), while every other event goes to
@@ -121,6 +126,7 @@ pub fn run_matching_thread(
     command_rx: Receiver<(ConnId, Command)>,
     return_tx: SyncSender<(ConnId, Event)>,
     market_data_tx: SyncSender<Event>,
+    mut risk_state: risk::RiskState,
 ) {
     let mut engine = Engine::new();
     let mut resting_conn: HashMap<(AccountId, OrderId), ConnId> =
@@ -136,7 +142,7 @@ pub fn run_matching_thread(
             Err(TryRecvError::Disconnected) => break,
         };
 
-        if let Some(rejected) = risk::pre_apply_check(&cmd) {
+        if let Some(rejected) = risk_state.pre_apply_check(&cmd, engine.book()) {
             let _ = return_tx.send((conn_id, rejected));
             continue;
         }
@@ -206,7 +212,10 @@ mod tests {
         let (command_tx, command_rx) = mpsc::sync_channel(16);
         let (return_tx, return_rx) = mpsc::sync_channel(16);
         let (market_data_tx, _market_data_rx) = mpsc::sync_channel::<Event>(16);
-        std::thread::spawn(move || run_matching_thread(command_rx, return_tx, market_data_tx));
+        let risk_state = risk::RiskState::new(risk::RiskConfig::default());
+        std::thread::spawn(move || {
+            run_matching_thread(command_rx, return_tx, market_data_tx, risk_state)
+        });
         (command_tx, return_rx)
     }
 

@@ -31,9 +31,15 @@ fn spawn_gateway() -> PathBuf {
     let (market_data_tx, _market_data_rx) = mpsc::sync_channel::<Event>(64);
 
     let return_tx_for_matching = return_tx.clone();
+    let risk_state = risk::RiskState::new(risk::RiskConfig::default());
     std::thread::spawn(move || run_order_entry(transport, command_tx, return_tx, return_rx));
     std::thread::spawn(move || {
-        run_matching_thread(command_rx, return_tx_for_matching, market_data_tx)
+        run_matching_thread(
+            command_rx,
+            return_tx_for_matching,
+            market_data_tx,
+            risk_state,
+        )
     });
 
     path

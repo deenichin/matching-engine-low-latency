@@ -30,6 +30,11 @@ pub struct Book {
     /// prevent (SPEC §4).
     pub(crate) order_index: HashMap<(AccountId, OrderId), u32>,
     pub(crate) accounts: HashMap<AccountId, AccountEntry>,
+    /// Price of the most recent fill, if any. Risk's price band and
+    /// Market-order notional resolution both prefer this over a computed
+    /// mid once the book has traded (SPEC §5). New bookkeeping for stage
+    /// 4 -- nothing needed this in stage 1.
+    pub(crate) last_trade: Option<Price>,
 }
 
 impl Book {
@@ -40,6 +45,7 @@ impl Book {
             arena: Arena::new(),
             order_index: HashMap::new(),
             accounts: HashMap::new(),
+            last_trade: None,
         }
     }
 
@@ -53,6 +59,43 @@ impl Book {
     /// is empty. `BTreeMap`'s first key (SPEC §4).
     pub fn best_ask(&self) -> Option<Price> {
         self.asks.keys().next().copied()
+    }
+
+    /// Price of the most recent fill, or `None` if the book has never
+    /// traded.
+    pub fn last_trade(&self) -> Option<Price> {
+        self.last_trade
+    }
+
+    /// An account's current open-order count, O(1) (SPEC §4/§5). Zero for
+    /// an account that has never rested an order.
+    pub fn account_open_order_count(&self, account_id: AccountId) -> usize {
+        self.accounts
+            .get(&account_id)
+            .map_or(0, |entry| entry.open_order_count())
+    }
+
+    /// An account's current gross notional, O(1) (SPEC §5). Zero for an
+    /// account that has never rested an order.
+    pub fn account_notional(&self, account_id: AccountId) -> u128 {
+        self.accounts
+            .get(&account_id)
+            .map_or(0, |entry| entry.notional())
+    }
+
+    /// A specific resting order's current price/qty, O(1) via the order
+    /// index -- for risk checks that need to compare a proposed amend
+    /// against what's actually resting (e.g. is this `CancelReplace` an
+    /// increase or a decrease). `None` if the account has no such
+    /// resting order (unknown id, wrong account, or already gone).
+    pub fn resting_order_snapshot(
+        &self,
+        account_id: AccountId,
+        order_id: OrderId,
+    ) -> Option<(Price, Qty)> {
+        let &slot = self.order_index.get(&(account_id, order_id))?;
+        let node = self.arena.get(slot)?;
+        Some((node.price, node.qty))
     }
 
     /// Insert a brand-new resting node at the back of its price level's
@@ -292,6 +335,7 @@ impl Book {
 
                 let fill_qty = remaining.min(maker.qty.0);
                 remaining -= fill_qty;
+                self.last_trade = Some(maker.price);
 
                 // Execution is always at the maker's resting price, never
                 // the taker's limit (SPEC §2).
@@ -2809,5 +2853,75 @@ mod tests {
                 model.assert_conserved(&book);
             }
         }
+    }
+
+    // -- Accessors risk (stage 4) reads --------------------------------
+
+    #[test]
+    fn last_trade_is_none_until_a_fill_happens() {
+        let mut book = Book::new();
+        assert_eq!(book.last_trade(), None);
+        submit(&mut book, 1, 1, Side::Sell, 100, 5);
+        assert_eq!(
+            book.last_trade(),
+            None,
+            "resting with no crossing is not a trade"
+        );
+        submit(&mut book, 2, 2, Side::Buy, 100, 5);
+        assert_eq!(book.last_trade(), Some(Price(100)));
+    }
+
+    #[test]
+    fn last_trade_reflects_the_most_recent_fill() {
+        let mut book = Book::new();
+        submit(&mut book, 1, 1, Side::Sell, 100, 5);
+        submit(&mut book, 1, 2, Side::Sell, 105, 5);
+        submit(&mut book, 2, 3, Side::Buy, 105, 10);
+        // Sweeps 100 first (price priority), then 105 -- last_trade
+        // reflects the LAST match, not the first.
+        assert_eq!(book.last_trade(), Some(Price(105)));
+    }
+
+    #[test]
+    fn account_open_order_count_and_notional_are_zero_for_an_unseen_account() {
+        let book = Book::new();
+        assert_eq!(book.account_open_order_count(AccountId(1)), 0);
+        assert_eq!(book.account_notional(AccountId(1)), 0);
+    }
+
+    #[test]
+    fn account_open_order_count_and_notional_reflect_resting_orders() {
+        let mut book = Book::new();
+        submit(&mut book, 1, 1, Side::Sell, 100, 5);
+        submit(&mut book, 1, 2, Side::Sell, 200, 3);
+        assert_eq!(book.account_open_order_count(AccountId(1)), 2);
+        assert_eq!(book.account_notional(AccountId(1)), 100 * 5 + 200 * 3);
+    }
+
+    #[test]
+    fn resting_order_snapshot_reflects_current_price_and_qty() {
+        let mut book = Book::new();
+        submit(&mut book, 1, 1, Side::Sell, 100, 5);
+        assert_eq!(
+            book.resting_order_snapshot(AccountId(1), OrderId(1)),
+            Some((Price(100), Qty(5)))
+        );
+
+        modify(&mut book, 1, 1, 100, 2); // decrease, retains priority
+        assert_eq!(
+            book.resting_order_snapshot(AccountId(1), OrderId(1)),
+            Some((Price(100), Qty(2)))
+        );
+    }
+
+    #[test]
+    fn resting_order_snapshot_is_none_for_unknown_or_wrong_account() {
+        let mut book = Book::new();
+        submit(&mut book, 1, 1, Side::Sell, 100, 5);
+        assert_eq!(
+            book.resting_order_snapshot(AccountId(1), OrderId(999)),
+            None
+        );
+        assert_eq!(book.resting_order_snapshot(AccountId(2), OrderId(1)), None);
     }
 }
