@@ -170,6 +170,22 @@ prices, violating "locked and crossed books are structurally impossible" and
 the `assert_invariants()` check that best bid strictly < best ask always
 holds, with no same-account exception.
 
+**Considered and rejected: an atomic, FOK-style precheck** that determines
+whether the order would end up crossing foreign depth *before* cancelling
+anything, only mutating once the outcome is known. Eager — cancelling a
+same-account resting order for real the instant the sweep reaches it — was
+chosen instead, because it matches the precedent already set by GTC, IOC,
+and Market: all three cancel a same-account resting order for real,
+immediately, the moment their sweep reaches it, regardless of what happens
+to the rest of the order afterward. PostOnly and FOK are the two order
+types with a genuine "reject the whole thing" outcome, which raises the
+question of whether a reject should mean "nothing happened, including to
+unrelated resting orders." FOK answers yes, because its precheck exists
+specifically to guarantee an all-or-nothing fill. PostOnly answers no:
+STP's job is to prevent a self-cross the moment the sweep attempts one, and
+whether the submitted order later rests or rejects for an unrelated reason
+doesn't retroactively un-attempt that self-cross.
+
 Implemented as: PostOnly's check walks the crossing levels on the opposite
 side, in the same price-time order a real sweep would. A same-account resting
 order encountered during the walk is cancelled for real via the ordinary
@@ -177,9 +193,8 @@ cancel-resting path — same unlink, same `Cancelled` event — not merely
 excluded from a count. The walk continues past it. A foreign resting order
 encountered during the walk stops the check immediately: the PostOnly order
 rejects `WouldCross`, and any same-account cancellations already performed
-earlier in the walk stand — they are not reversed, since STP removing a
-self-trade risk is correct regardless of what the order ultimately does. If
-the walk reaches the end of crossing depth without finding any foreign order,
+earlier in the walk stand — not reversed, per the decision above. If the
+walk reaches the end of crossing depth without finding any foreign order,
 the PostOnly order rests in full. No foreign quantity is ever matched or
 consumed by a PostOnly order under any outcome.
 
@@ -294,8 +309,9 @@ than one thread.
 **Gateway thread** owns the order-entry socket. Accepts connections, assigns a
 `ConnId`, reads and frames bytes, validates, and pushes `(ConnId, Command)` onto
 a bounded channel. It also owns the write side for that socket: it receives
-`(ConnId, Vec<Event>)` back and writes execution reports to the originating
-connection.
+`(ConnId, Event)` items back, one per event, and writes each execution report
+to the originating connection as it arrives — never a `Vec<Event>`, per the
+channel design below.
 
 **Matching thread** is the sole writer to `Engine`. It **busy-spins** on the
 command channel rather than blocking, avoiding futex wake and context-switch
@@ -426,8 +442,16 @@ array. Maintenance:
   access.
 - **cancel / unlink**: `slots.swap_remove(node.acct_idx)`; if an element moved
   into that position, write its node's `acct_idx`. **At most one** random write.
-- **MassCancel**: walk `slots` contiguously (prefetchable), unlinking each from
-  its level, then clear.
+- **MassCancel**: snapshot `slots` in its current order, then call the same
+  cancel/unlink path once per order in that snapshot. Each call's
+  `swap_remove` acts on the live array as it stands at that moment, which is
+  correct regardless of how many earlier iterations in the same mass-cancel
+  already shrank it. This costs `N` real `swap_remove`s rather than a single
+  bulk `clear()` at the end — deliberately: account-index maintenance lives
+  in exactly one path, `unlink`, never a second one bolted on for the bulk
+  case, which is what CLAUDE.md's "exactly two places — `rest` and `unlink`"
+  rule is protecting. The bulk-`clear()` shortcut was considered and
+  rejected on those grounds.
 - **Risk check**: `slots.len()` and `notional`, both O(1) behind one map lookup.
 
 Open-order count is `slots.len()` rather than a separate cached field, so there

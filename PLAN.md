@@ -80,7 +80,12 @@ IOC discards; FOK all-or-nothing; FOK counts only crossable depth; FOK rejects
 when all crossable depth is the aggressor's own; PostOnly rejects a crossing
 order; PostOnly rests when not crossing; PostOnly crossing only its own
 resting order cancels that resting order for real (emits `Cancelled`) and
-rests, instead of rejecting `WouldCross`; market order partial-fills and
+rests, instead of rejecting `WouldCross`; **PostOnly crossing self-owned
+depth *and* foreign depth beyond it cancels the self-owned depth for real
+and still rejects `WouldCross` against the foreign depth, with the
+cancellation not reversed** (the eager-vs-atomic decision in SPEC §2 — this
+is the case the quantity-conservation property test's shrunk failure
+found); market order partial-fills and
 discards; modify-decrease retains priority; modify-increase loses it;
 `modify_price_change_crosses_emits_replaced_then_filled` (asserts exact event
 sequence, not just presence); modify price change without crossing; STP cancels
