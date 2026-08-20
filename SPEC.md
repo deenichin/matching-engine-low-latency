@@ -42,9 +42,21 @@ Stated first, deliberately. Out of scope, not attempted:
   the notional arithmetic in §5 mean what it says. For a BTC/USDT book: price is
   USDT-per-BTC in cents, qty is BTC in ten-thousandths, product is USDT cents.
 - `OrderId`: `u64`, client-assigned, unique among an account's *currently
-  active* orders.
+  active* orders. **Not globally unique** — two different accounts may submit
+  the same numeric id concurrently. Every lookup, index, and duplicate check is
+  therefore keyed on `(AccountId, OrderId)`, never bare `OrderId` (§4).
 - `AccountId`: `u64`. Every order carries one. Not optional.
-- `Seq`: `u64`, engine-assigned, strictly monotonic across all outbound streams.
+- `EngineSeq`: `u64`, engine-assigned, strictly monotonic across every command
+  the engine applies. Used for internal ordering and the determinism
+  comparison in §7. Not a per-stream sequence number — see `StreamSeq` below.
+- `StreamSeq`: `u64`, one independent monotonic counter **per outbound
+  stream** — one for execution reports, one for market data. Gap detection
+  (§8) is only meaningful against a counter that increments exactly once per
+  message actually delivered on that stream. A single counter shared across
+  streams increments on every event regardless of which stream carries it, so
+  a subscriber to one stream sees permanent phantom gaps for every event that
+  went out the other stream. Each outbound message carries its stream's
+  `StreamSeq`, not `EngineSeq`.
 - Symbol is hardcoded to one instrument. Tick size, lot size, and all risk
   defaults are named constants.
 
@@ -206,9 +218,9 @@ Orders carry: `order_id`, `account_id`, `side`, `price`, `qty`, `order_type`,
 
 ### Outbound messages
 
-**Execution reports** carry: `order_id`, `engine_seq`, state (`accepted` /
-`rejected` / `partially_filled` / `filled` / `cancelled`), fill `price` and
-`qty`, and a `reason` code on reject.
+**Execution reports** carry: `order_id`, `stream_seq` (this stream's counter,
+per §2), state (`accepted` / `rejected` / `partially_filled` / `filled` /
+`cancelled`), fill `price` and `qty`, and a `reason` code on reject.
 
 **Market data**: `Trade` prints on every execution; `BookUpdate` (top-of-book)
 on every book change. Both carry monotonic sequence numbers so a subscriber can
@@ -271,7 +283,16 @@ to prevent. Separating them means a slow subscriber degrades only its own feed.
 `ConnId` is passed through opaquely — `Engine` never sees it. This is what keeps
 `core` free of any connection concept.
 
-Channels are bounded and pre-allocated.
+**Channels carry individual `(ConnId, Event)` items, never a `Vec<Event>`.**
+`Event` is small and `Copy`. A channel of `Vec<Event>` looks bounded and
+pre-allocated at the channel level, but the payload is a fresh heap allocation
+on every dispatch that produces one or more events — which is every submit,
+cancel, and modify, i.e. the entire hot path. `std::mem::take` on a reused
+output buffer does not avoid this either: it replaces the buffer with a
+zero-capacity `Vec`, so the next call's first push reallocates. One send per
+event, not one send per command, is what actually satisfies the zero-allocation
+rule in CLAUDE.md. The matching thread sends `Filled` and `Accepted`/`Rejected`
+individually as they are produced, not batched into a collection first.
 
 ### Book data structures
 
@@ -284,8 +305,17 @@ Channels are bounded and pre-allocated.
   valid until freed, which is what allows plain `u32` links instead of
   `Rc<RefCell<_>>` — no per-node allocation, no runtime borrow checks, no
   reference-cycle leak risk.
-- Order index: `HashMap<OrderId, u32>` mapping id to arena slot. The slot carries
-  side, price, and account, so cancel keys straight into the right level.
+- Order index: `HashMap<(AccountId, OrderId), u32>` mapping id to arena slot.
+  Keyed on the pair, not bare `OrderId` — §2 scopes id uniqueness *per account*,
+  so two different accounts may legally submit the same numeric id, and a bare
+  `OrderId` key cannot hold both without one silently overwriting the other's
+  index entry. The slot itself carries side, price, and account, so cancel and
+  modify key straight into the right level.
+
+  Keying on the pair also removes a separate ownership-comparison step: a
+  lookup with the wrong `AccountId` simply misses, identical in shape to an
+  unknown id. The no-oracle rule (§2) falls out of the index design rather than
+  needing an explicit check after a successful lookup.
 
 Rationale for the README, with the rejected alternative: an index lookup alone
 only locates the level; without intrusive links, removal from within a level is
@@ -411,10 +441,20 @@ no setup:
 - `max_open_orders`: **50** per account
 - `max_notional`: **100_000_000 ticks** ($1,000,000)
 
+**Market orders carry `price = 0` on the wire (§2), which the notional formula
+below would otherwise read as zero notional regardless of size — an unbounded
+market order is the more dangerous case, not an exempt one.** For notional
+purposes only, a Market order's price is the same reference price used for the
+price band: last trade, else book mid if both sides have depth. If neither
+exists, the book has never traded and has no two-sided depth, and a Market
+order is rejected with `NotFullyFillable` rather than let through uncapped —
+there is nothing for it to fill against in that state regardless.
+
 Notional is **gross**: `price × qty` summed across *all* the account's resting
 orders regardless of side, plus the incoming order, read in O(1) from
 `AccountEntry` (§4). A two-sided quote of 500k on each side consumes the full
-1M cap.
+1M cap. For a Market order, `price` in this formula is the reference price
+above, not the wire value.
 
 Net notional (bid minus ask) was considered and rejected. It does not bound
 worst-case exposure — nothing prevents both sides of a two-sided quote filling
@@ -552,10 +592,19 @@ reports and market data, including sequence numbers.
 - Engine-assigned timestamps excluded from comparison via a documented
   `--exclude-timestamps` flag
 
-**Recording** captures the decoded, post-validation `Command` sequence to a
-file. **Replay** reads that file and feeds `Engine` directly, bypassing the
-socket — which is what makes byte-identical output achievable, by construction
-excluding I/O nondeterminism from the replay path.
+**Recording** captures the decoded, post-*gateway-validation* `Command`
+sequence — i.e., after frame decode and the checks in §3 (length, enum range,
+nonzero fields), before risk. **Replay** feeds that sequence through the full
+risk-then-matching pipeline exactly as live traffic does; it bypasses only the
+socket and framing layer, not risk.
+
+This is a deliberate choice, not the only reading available. Feeding `Engine`
+directly and skipping risk would also be internally consistent, but it proves a
+strictly weaker property: it could not confirm that the kill switch, price
+band, or notional cap reject identically on every replay, which are exactly the
+cases deterministic replay is most valuable for verifying. Replaying through
+risk means a command that was rejected live must be rejected identically on
+replay, not silently accepted.
 
 A recorded stream and the replay command ship in the repo.
 
@@ -564,7 +613,8 @@ A recorded stream and the replay command ship in the repo.
 ## 8. Market data
 
 - `BookUpdate` (top-of-book) on every book change; `Trade` on every execution
-- Monotonic sequence numbers on both, with gap-detection hooks
+- Each carries its own `StreamSeq` (§2) — independent from execution
+  reports' — with gap-detection hooks
 
 **Backpressure: bounded channel, drop-oldest.** The matching thread must never
 block on a slow subscriber — that would let market data stall the hot path and
@@ -699,7 +749,7 @@ without explicit approval. Commit at stage boundaries only.
 | **0** | Workspace, crate skeletons, domain types, reason codes, `check.sh`, Dockerfile + compose skeleton | `./check.sh` green; `cargo tree -p core` empty; `docker compose up` runs a stub |
 | **1** | `core`: arena, levels, account index, matching, cancel, modify, mass-cancel, all TIFs, STP, `assert_invariants()`, scenario + conservation property tests | All §6 layers green for core behaviour |
 | **2** | `wire`: message schemas, encode/decode, framing, round-trip and malformed-input tests | Every message type round-trips; all malformed cases rejected |
-| **3** | `gateway` + `bin`: `Transport` trait, UDS impl, gateway and matching threads (of three — market data thread arrives in stage 5), execution reports, end-to-end order flow | An order sent over the socket produces a correct execution report |
+| **3** | `gateway` + `bin`: `Transport` trait, UDS impl, two-thread topology, execution reports, end-to-end order flow | An order sent over the socket produces a correct execution report |
 | **4** | `risk`: kill switch (drain, checked in the matching loop), per-account limits, price band, full reason taxonomy | Each control has a scenario test with its distinct reason code |
 | **5** | `marketdata`: top-of-book + trade prints, sequence numbers, drop-oldest backpressure, gap detection | A subscriber receives both streams; gap detection tested |
 | **6** | Determinism: record + replay, byte-identical comparison, determinism property test, concurrent-submission priority test | Replay is byte-identical; concurrency test green |

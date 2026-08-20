@@ -35,7 +35,9 @@ Requirements: @SPEC.md. Staged build with gates: @PLAN.md.
 - **No heap allocation on the hot path against existing price levels.** Decode,
   risk check, match, and encode on a warm engine must not allocate when the
   operation touches only price levels that already exist. Buffers are
-  caller-owned and reused. Channels are bounded and pre-allocated. Per-account
+  caller-owned and reused. Channels are bounded and pre-allocated, and carry
+  individual events, never a `Vec<Event>` — a per-dispatch collection defeats
+  this rule regardless of how the channel itself is provisioned. Per-account
   slot arrays are reserved at account creation and never grow.
 - **Price-level creation and removal may occasionally allocate.** `BTreeMap`
   allocates only when a node splits (B=6, so up to 11 entries per node), not on
@@ -55,6 +57,10 @@ Requirements: @SPEC.md. Staged build with gates: @PLAN.md.
 - **No `HashMap` iteration order may reach output.** Iterating a `HashMap` to
   produce events or market data breaks byte-identical replay. Use an ordered
   structure or an explicitly ordered traversal.
+- **`OrderId` is never a standalone map key.** It is unique per account, not
+  globally (SPEC §2). Every index, lookup, and duplicate check uses
+  `(AccountId, OrderId)`. If you find yourself writing `HashMap<OrderId, _>`
+  anywhere, stop — that is the bug SPEC §4 was amended to prevent.
 - **No `unwrap()`/`expect()` on anything derived from wire input.** Permitted
   only for internal invariants that cannot fail, each with a naming comment.
 - **Node size discipline.** `Node` is intended to stay within one 64-byte cache

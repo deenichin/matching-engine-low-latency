@@ -50,7 +50,9 @@ Build order (each step verified before the next):
    qty, account, `prev`/`next` as `u32` slots, and `acct_idx: u32`. Check the
    struct size against the 64-byte cache-line target before proceeding.
 2. `Level` — head/tail, cached `total_qty`, `count`
-3. `BTreeMap<Price, Level>` per side; `HashMap<OrderId, u32>` order index
+3. `BTreeMap<Price, Level>` per side; `HashMap<(AccountId, OrderId), u32>`
+   order index — keyed on the pair, since `OrderId` is only unique per account
+   (SPEC §2, §4)
 4. `AccountEntry { slots: Vec<u32>, notional: u128 }` and
    `HashMap<AccountId, AccountEntry>`. `slots` reserved to `MAX_OPEN_ORDERS` on
    first sight of an account. Maintenance lives in exactly two places: `rest()`
@@ -69,7 +71,10 @@ Build order (each step verified before the next):
 
 Scenario tests: FIFO within a level; sweep across levels; maker-price execution;
 partial fill rests remainder; cancel from head/middle/tail; cancel empties a
-level; cancel and modify rejected for wrong account, identically to unknown id;
+level; **two different accounts submitting the same numeric OrderId both
+succeed independently** (the case the (AccountId, OrderId) key exists to fix —
+this is the single most important new test in this stage); cancel and modify
+rejected for wrong account, identically to unknown id;
 IOC discards; FOK all-or-nothing; FOK counts only crossable depth; FOK rejects
 when all crossable depth is the aggressor's own; PostOnly rejects a crossing
 order; PostOnly rests when not crossing; market order partial-fills and
@@ -118,7 +123,8 @@ reason code. Commit `feat: binary wire protocol`.
 3. Accept loop, `ConnId` assignment, per-connection read buffers
 4. Bounded `(ConnId, Command)` channel to the matching thread
 5. Matching thread: busy-spin, sole `Engine::apply` caller
-6. Bounded `(ConnId, Vec<Event>)` return channel; gateway writes reports
+6. Bounded `(ConnId, Event)` return channel — **individual events, never
+   `Vec<Event>`** (SPEC §4); gateway writes each report as it arrives
 7. `bin` wires it together; graceful shutdown
 
 The market-data thread (SPEC §4) arrives in stage 5 along with its socket. This
@@ -137,9 +143,12 @@ matching thread`.
 2. Per-account open-order count and notional read from `AccountEntry` (O(1),
    already maintained in stage 1 — this stage adds the *checks*, not the
    bookkeeping)
-3. Price band vs. last-trade reference, book-mid fallback, skip on empty book
-4. `risk.toml` loading with baked-in defaults
-5. Control-plane messages: `KillSwitch`, `Snapshot`
+3. Price band vs. last-trade reference, book-mid fallback, skip on empty book,
+   skipped (not zero) for Market
+4. Notional for Market orders uses the same reference price as the band, not
+   the wire `price = 0` — reject `NotFullyFillable` if no reference exists yet
+5. `risk.toml` loading with baked-in defaults
+6. Control-plane messages: `KillSwitch`, `Snapshot`
 
 Tests: kill switch rejects new entry; kill switch still allows cancel of resting
 orders (drain); a command already queued when the switch fires is still
@@ -148,8 +157,11 @@ breach; notional arithmetic near `u64::MAX` does not wrap (the `u128` case);
 price band above and below; band skipped on an empty book; band skipped on a
 one-sided book (bids only, no asks — mid is undefined); band uses last trade in
 preference to mid once a trade has occurred; band does not apply to Market
-orders; modify to zero quantity rejected with `ZeroQuantity`; each with its
-distinct reason code.
+orders; **Market order notional uses the reference price, not the wire
+price = 0 — a large Market order against thin reference liquidity breaches the
+cap** (this is the test that would have caught the original gap); Market
+rejected with NotFullyFillable when no reference price exists; modify to zero
+quantity rejected with `ZeroQuantity`; each with its distinct reason code.
 
 **Exit:** every control has a scenario test naming its reason code. Commit
 `feat: risk and operational controls`.
@@ -160,16 +172,20 @@ distinct reason code.
 
 1. Second UDS listener on its **own thread** (SPEC §4), subscriber management
 2. `BookUpdate` on every book change; `Trade` on every execution
-3. Monotonic sequence numbers, shared counter with execution reports
+3. Independent `StreamSeq` counter for this stream, per SPEC §2 — **not**
+   shared with execution reports' counter, and not `EngineSeq`
 4. Bounded broadcast, drop-oldest, never blocking the matching thread
 5. Gap detection hooks on the subscriber side
 
-Tests: subscriber receives both streams; sequence numbers monotonic across both
-outbound streams; a deliberately slow subscriber drops rather than stalling the
-matcher; a deliberately slow subscriber does not stall **order entry** either —
-this is the specific coupling the separate thread exists to prevent, so assert
-order-entry throughput is unaffected while a subscriber is blocked; the gap is
-detectable from sequence numbers.
+Tests: subscriber receives both streams; **each stream's `StreamSeq` is
+monotonic and gapless under normal operation on its own** — an execution-report
+event must never advance market data's counter or vice versa; a deliberately
+slow subscriber drops rather than stalling the matcher; a deliberately slow
+subscriber does not stall **order entry** either — this is the specific
+coupling the separate thread exists to prevent, so assert order-entry
+throughput is unaffected while a subscriber is blocked; a drop is detectable as
+a gap in the *affected stream's own* `StreamSeq`, without a phantom gap
+appearing on the unaffected stream.
 
 **Exit:** both streams verified; backpressure tested. Commit `feat: market data
 streams`.
@@ -178,10 +194,14 @@ streams`.
 
 ## Stage 6 — Determinism
 
-1. Recording: decoded post-validation `Command` sequence to a file
-2. Replay: read file, feed `Engine` directly, bypassing sockets
+1. Recording: decoded post-gateway-validation `Command` sequence to a file
+   (before risk — see SPEC §7)
+2. Replay: read file, feed the sequence through risk-then-matching exactly as
+   live traffic does; bypass only the socket and framing layer
 3. `--exclude-timestamps` flag, documented
-4. Byte-identical comparison of the full outbound stream
+4. Byte-identical comparison of the full outbound stream — **including
+   rejections**: a command risk-rejected on the original run must be
+   risk-rejected identically on replay, not silently accepted
 5. Determinism property test over the full operation set, mass-cancel included
 6. Concurrent-submission priority test: multiple client threads over real
    sockets, asserting fills reflect strict arrival order at the matcher
