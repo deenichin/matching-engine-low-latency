@@ -449,9 +449,10 @@ array. Maintenance:
   already shrank it. This costs `N` real `swap_remove`s rather than a single
   bulk `clear()` at the end — deliberately: account-index maintenance lives
   in exactly one path, `unlink`, never a second one bolted on for the bulk
-  case, which is what CLAUDE.md's "exactly two places — `rest` and `unlink`"
-  rule is protecting. The bulk-`clear()` shortcut was considered and
-  rejected on those grounds.
+  case. That discipline — `rest` and `unlink` are the only two places that
+  ever touch `slots`/`acct_idx` — is what keeps CLAUDE.md's O(1)
+  cancel/modify rule true by inspection rather than by convention. The
+  bulk-`clear()` shortcut was considered and rejected on those grounds.
 - **Risk check**: `slots.len()` and `notional`, both O(1) behind one map lookup.
 
 Open-order count is `slots.len()` rather than a separate cached field, so there
