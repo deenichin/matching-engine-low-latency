@@ -1,0 +1,14 @@
+# Risk configuration used only by `bench` (SPEC §9), never by the
+# production daemon (`risk.toml`). max_open_orders and max_notional_ticks
+# are raised generously so a sustained 1M-message burst doesn't trip them
+# mid-run -- the harness measures matching hot-path latency, and a flood of
+# risk-rejects under the production caps would contaminate that
+# distribution with reject latency instead. price_band_pct is left at the
+# production value deliberately, not by oversight: the burst workload's own
+# resting prices (9950-10050) stay within a ~1% band of each other and of
+# any last_trade value the run can produce, so the production band never
+# rejects legitimate workload traffic and doesn't need relaxing.
+
+max_open_orders = 1_000_000
+max_notional_ticks = 1_000_000_000_000
+price_band_pct = 10

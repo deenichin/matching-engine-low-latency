@@ -39,6 +39,14 @@ pub struct Book {
     /// mid once the book has traded (SPEC §5). New bookkeeping for stage
     /// 4 -- nothing needed this in stage 1.
     pub(crate) last_trade: Option<Price>,
+    /// Reused scratch space for `mass_cancel`'s slot snapshot -- avoids
+    /// `entry.slots.clone()` allocating fresh on every call (SPEC §6, §9:
+    /// found by the `hot_path_allocates_nothing` allocation test). Starts
+    /// empty and grows to whatever the largest single `mass_cancel` call
+    /// has needed so far, then never shrinks -- the same "reserve once,
+    /// reuse forever" shape as `AccountEntry::slots`, just discovered for
+    /// this buffer later.
+    mass_cancel_scratch: Vec<u32>,
 }
 
 impl Book {
@@ -50,6 +58,7 @@ impl Book {
             order_index: HashMap::new(),
             accounts: HashMap::new(),
             last_trade: None,
+            mass_cancel_scratch: Vec::new(),
         }
     }
 
@@ -874,13 +883,23 @@ impl Book {
     /// each call's `swap_remove` acts on whatever the live array's
     /// *current* state is, which is exactly what the next iteration
     /// needs regardless of how earlier iterations shrank it.
+    ///
+    /// The snapshot lives in `mass_cancel_scratch`, reused across calls
+    /// rather than a fresh `Vec` cloned from `entry.slots` each time
+    /// (found allocating by `hot_path_allocates_nothing`, SPEC §6/§9):
+    /// `extend_from_slice` after `clear` ends the immutable borrow on
+    /// `self.accounts` the same way the clone did, without allocating
+    /// once the buffer has grown to cover the largest mass-cancel this
+    /// `Book` has handled so far.
     pub fn mass_cancel(&mut self, account_id: AccountId, emit: &mut dyn FnMut(Event)) {
         let Some(entry) = self.accounts.get(&account_id) else {
             return;
         };
-        let snapshot: Vec<u32> = entry.slots.clone();
+        self.mass_cancel_scratch.clear();
+        self.mass_cancel_scratch.extend_from_slice(&entry.slots);
 
-        for slot in snapshot {
+        for i in 0..self.mass_cancel_scratch.len() {
+            let slot = self.mass_cancel_scratch[i];
             let order_id = self
                 .arena
                 .get(slot)

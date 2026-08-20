@@ -5,6 +5,16 @@ edition.workspace = true
 
 [dependencies]
 core = { path = "../core" }
+allocation-counter = { version = "0.8", optional = true }
 
 [dev-dependencies]
 proptest = "1"
+
+[features]
+default = []
+count-allocations = ["dep:allocation-counter"]
+
+[[test]]
+name = "zero_alloc"
+path = "tests/zero_alloc.rs"
+required-features = ["count-allocations"]

@@ -7,3 +7,8 @@ edition.workspace = true
 
 [dev-dependencies]
 proptest = "1"
+criterion = "0.8"
+
+[[bench]]
+name = "matching_engine"
+harness = false

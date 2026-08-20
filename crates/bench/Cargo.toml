@@ -4,3 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+core = { path = "../core" }
+wire = { path = "../wire" }
+bin = { path = "../bin" }
+hdrhistogram = "7"
