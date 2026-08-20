@@ -10,4 +10,8 @@ path = "src/main.rs"
 [dependencies]
 core = { path = "../core" }
 gateway = { path = "../gateway" }
+marketdata = { path = "../marketdata" }
 risk = { path = "../risk" }
+
+[dev-dependencies]
+wire = { path = "../wire" }

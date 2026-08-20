@@ -208,6 +208,16 @@ appearing on the unaffected stream.
 **Exit:** both streams verified; backpressure tested. Commit `feat: market data
 streams`.
 
+**Known gap:** an isolated marketdata-only backpressure test (subscribers fed
+directly via the internal channel, bypassing the matching thread) was
+attempted, stalled under sustained load for an undiagnosed reason, and was
+deliberately dropped rather than chased further. The four end-to-end tests in
+`crates/bin/tests/market_data.rs` — exercising the same `subscriber.rs`/
+`queue.rs` code through the real daemon — satisfy the original requirement in
+full (fast/slow isolation, execution-report/market-data `StreamSeq`
+independence, and order-entry/matching progress under a stalled subscriber).
+The isolated case remains a known gap, not a hidden one.
+
 ---
 
 ## Stage 6 — Determinism

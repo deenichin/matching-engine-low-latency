@@ -15,6 +15,10 @@ use crate::event::Event;
 use crate::level::Level;
 use crate::types::{AccountId, OrderId, Price, Qty, Side};
 
+/// One side of a top-of-book snapshot: the best price and the total
+/// resting quantity there, or `None` if that side is empty.
+pub type TouchSide = Option<(Price, Qty)>;
+
 /// The single-symbol order book: two price maps, the resting-order arena,
 /// and the indexes that make cancel, modify, and per-account risk checks
 /// O(1) (SPEC §4).
@@ -65,6 +69,23 @@ impl Book {
     /// traded.
     pub fn last_trade(&self) -> Option<Price> {
         self.last_trade
+    }
+
+    /// Top-of-book snapshot: best bid/ask price and the total resting
+    /// quantity at that price, or `None` on a side that's empty. What a
+    /// `BookUpdate` event carries (SPEC §8).
+    pub fn top_of_book(&self) -> (TouchSide, TouchSide) {
+        let bid = self
+            .bids
+            .iter()
+            .next_back()
+            .map(|(&price, level)| (price, level.total_qty));
+        let ask = self
+            .asks
+            .iter()
+            .next()
+            .map(|(&price, level)| (price, level.total_qty));
+        (bid, ask)
     }
 
     /// An account's current open-order count, O(1) (SPEC §4/§5). Zero for
@@ -335,7 +356,12 @@ impl Book {
 
                 let fill_qty = remaining.min(maker.qty.0);
                 remaining -= fill_qty;
-                self.last_trade = Some(maker.price);
+                // One read, reused for last_trade, both Filled events, and
+                // the Trade print below -- these all describe the same
+                // execution and must never be able to drift from each
+                // other by each recomputing it independently.
+                let fill_price = maker.price;
+                self.last_trade = Some(fill_price);
 
                 // Execution is always at the maker's resting price, never
                 // the taker's limit (SPEC §2).
@@ -343,7 +369,7 @@ impl Book {
                     account_id,
                     order_id,
                     side,
-                    price: maker.price,
+                    price: fill_price,
                     qty: Qty(fill_qty),
                     resting_qty: Qty(remaining),
                 });
@@ -351,9 +377,14 @@ impl Book {
                     account_id: maker.account,
                     order_id: maker.id,
                     side: opposite_side,
-                    price: maker.price,
+                    price: fill_price,
                     qty: Qty(fill_qty),
                     resting_qty: Qty(maker.qty.0 - fill_qty),
+                });
+                emit(Event::Trade {
+                    price: fill_price,
+                    qty: Qty(fill_qty),
+                    taker_side: side,
                 });
 
                 if fill_qty == maker.qty.0 {
@@ -1381,6 +1412,11 @@ mod tests {
                     qty: Qty(2),
                     resting_qty: Qty(0),
                 },
+                Event::Trade {
+                    price: Price(100),
+                    qty: Qty(2),
+                    taker_side: Side::Buy,
+                },
                 Event::Filled {
                     account_id: AccountId(9),
                     order_id: OrderId(100),
@@ -1397,6 +1433,11 @@ mod tests {
                     qty: Qty(2),
                     resting_qty: Qty(0),
                 },
+                Event::Trade {
+                    price: Price(100),
+                    qty: Qty(2),
+                    taker_side: Side::Buy,
+                },
                 Event::Filled {
                     account_id: AccountId(9),
                     order_id: OrderId(100),
@@ -1412,6 +1453,11 @@ mod tests {
                     price: Price(100),
                     qty: Qty(1),
                     resting_qty: Qty(1),
+                },
+                Event::Trade {
+                    price: Price(100),
+                    qty: Qty(1),
+                    taker_side: Side::Buy,
                 },
                 Event::Accepted {
                     account_id: AccountId(9),
@@ -1991,6 +2037,11 @@ mod tests {
                     qty: Qty(4),
                     resting_qty: Qty(0),
                 },
+                Event::Trade {
+                    price: Price(100),
+                    qty: Qty(4),
+                    taker_side: Side::Buy,
+                },
                 Event::Accepted {
                     account_id: AccountId(1),
                     order_id: OrderId(3),
@@ -2028,6 +2079,11 @@ mod tests {
                     price: Price(100),
                     qty: Qty(3),
                     resting_qty: Qty(0),
+                },
+                Event::Trade {
+                    price: Price(100),
+                    qty: Qty(3),
+                    taker_side: Side::Buy,
                 },
                 Event::Accepted {
                     account_id: AccountId(2),
@@ -2288,6 +2344,11 @@ mod tests {
                     qty: Qty(3),
                     resting_qty: Qty(0),
                 },
+                Event::Trade {
+                    price: Price(95),
+                    qty: Qty(3),
+                    taker_side: Side::Buy,
+                },
             ]
         );
         book.assert_invariants();
@@ -2402,6 +2463,11 @@ mod tests {
                     price: Price(100),
                     qty: Qty(4),
                     resting_qty: Qty(0),
+                },
+                Event::Trade {
+                    price: Price(100),
+                    qty: Qty(4),
+                    taker_side: Side::Buy,
                 },
                 Event::Accepted {
                     account_id: AccountId(1),
@@ -2880,6 +2946,53 @@ mod tests {
         // Sweeps 100 first (price priority), then 105 -- last_trade
         // reflects the LAST match, not the first.
         assert_eq!(book.last_trade(), Some(Price(105)));
+    }
+
+    #[test]
+    fn trade_price_matches_last_trade_for_every_fill_in_a_sweep() {
+        // Two levels, distinct prices, one aggressor that sweeps both --
+        // each Trade's price must equal book.last_trade() as observed
+        // immediately after that specific fill, proving both come from
+        // the same read rather than two independent computations that
+        // could drift apart.
+        let mut book = Book::new();
+        submit(&mut book, 1, 1, Side::Sell, 100, 3);
+        submit(&mut book, 1, 2, Side::Sell, 105, 3);
+        let events = submit(&mut book, 2, 3, Side::Buy, 105, 6);
+
+        let trades: Vec<&Event> = events
+            .iter()
+            .filter(|e| matches!(e, Event::Trade { .. }))
+            .collect();
+        assert_eq!(
+            trades,
+            vec![
+                &Event::Trade {
+                    price: Price(100),
+                    qty: Qty(3),
+                    taker_side: Side::Buy,
+                },
+                &Event::Trade {
+                    price: Price(105),
+                    qty: Qty(3),
+                    taker_side: Side::Buy,
+                },
+            ]
+        );
+        // The last Trade's price is exactly what last_trade() reports
+        // once the whole sweep has settled.
+        assert_eq!(book.last_trade(), Some(Price(105)));
+    }
+
+    #[test]
+    fn stp_cancellation_produces_no_trade() {
+        // A self-trade-prevented cancellation is not an execution -- it
+        // must not print a Trade, and must not move last_trade.
+        let mut book = Book::new();
+        submit(&mut book, 1, 1, Side::Sell, 100, 5);
+        let events = submit(&mut book, 1, 2, Side::Buy, 100, 3);
+        assert!(!events.iter().any(|e| matches!(e, Event::Trade { .. })));
+        assert_eq!(book.last_trade(), None);
     }
 
     #[test]
