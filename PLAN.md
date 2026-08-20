@@ -21,9 +21,10 @@ describes, plus the types the rest of the system is expressed in.
 - `Cargo.toml` — convert to `[workspace]`, members: `core`, `wire`, `risk`,
   `gateway`, `marketdata`, `bin`, `bench`, matching the dependency direction in
   SPEC §4 (each crate's own `Cargo.toml` depends only downward)
-- `crates/core/src/types.rs` — `Price`, `Qty`, `OrderId`, `AccountId`, `Seq`,
-  `Side`, `OrderKind`, `Tif`, with the unit semantics from SPEC §2 in doc
-  comments (price is quote-per-base-lot; qty is base lots)
+- `crates/core/src/types.rs` — `Price`, `Qty`, `OrderId`, `AccountId`,
+  `EngineSeq`, `StreamSeq`, `Side`, `OrderKind`, `Tif`, with the unit
+  semantics from SPEC §2 in doc comments (price is quote-per-base-lot; qty is
+  base lots)
 - `crates/core/src/event.rs` — `Command`, `Event`
 - `crates/core/src/error.rs` — the full `RejectReason` taxonomy from SPEC §5,
   each variant with its distinct wire value
@@ -77,7 +78,9 @@ this is the single most important new test in this stage); cancel and modify
 rejected for wrong account, identically to unknown id;
 IOC discards; FOK all-or-nothing; FOK counts only crossable depth; FOK rejects
 when all crossable depth is the aggressor's own; PostOnly rejects a crossing
-order; PostOnly rests when not crossing; market order partial-fills and
+order; PostOnly rests when not crossing; PostOnly crossing only its own
+resting order cancels that resting order for real (emits `Cancelled`) and
+rests, instead of rejecting `WouldCross`; market order partial-fills and
 discards; modify-decrease retains priority; modify-increase loses it;
 `modify_price_change_crosses_emits_replaced_then_filled` (asserts exact event
 sequence, not just presence); modify price change without crossing; STP cancels
@@ -145,23 +148,33 @@ matching thread`.
    bookkeeping)
 3. Price band vs. last-trade reference, book-mid fallback, skip on empty book,
    skipped (not zero) for Market
-4. Notional for Market orders uses the same reference price as the band, not
-   the wire `price = 0` — reject `NotFullyFillable` if no reference exists yet
+4. Notional for Market orders is resolved **differently from the band**: last
+   trade price, else the best price on the side the order sweeps (best ask
+   for a buy, best bid for a sell) — never the wire `price = 0`, and never
+   the band's two-sided mid, which a one-sided book can't produce. Reject
+   `NotFullyFillable` only if neither exists (nothing to sweep at all).
 5. `risk.toml` loading with baked-in defaults
 6. Control-plane messages: `KillSwitch`, `Snapshot`
 
 Tests: kill switch rejects new entry; kill switch still allows cancel of resting
 orders (drain); a command already queued when the switch fires is still
-rejected; max open orders breach at exactly the cap boundary; max notional
+rejected; CancelReplace during drain that only decreases quantity is allowed;
+a CancelReplace during drain that increases quantity or changes price is
+blocked with `KillSwitchActive`, identically to a blocked new order; max
+open orders breach at exactly the cap boundary; max notional
 breach; notional arithmetic near `u64::MAX` does not wrap (the `u128` case);
 price band above and below; band skipped on an empty book; band skipped on a
 one-sided book (bids only, no asks — mid is undefined); band uses last trade in
 preference to mid once a trade has occurred; band does not apply to Market
 orders; **Market order notional uses the reference price, not the wire
 price = 0 — a large Market order against thin reference liquidity breaches the
-cap** (this is the test that would have caught the original gap); Market
-rejected with NotFullyFillable when no reference price exists; modify to zero
-quantity rejected with `ZeroQuantity`; each with its distinct reason code.
+cap** (this is the test that would have caught the original gap); **a Market
+order into a one-sided book with real depth on the side it sweeps fills
+normally and is not rejected for notional** (the regression test for the
+bug the reference-price resolution was corrected to fix); Market rejected
+with NotFullyFillable only when no depth exists on the side it sweeps and no
+trade has occurred; modify to zero quantity rejected with `ZeroQuantity`;
+each with its distinct reason code.
 
 **Exit:** every control has a scenario test naming its reason code. Commit
 `feat: risk and operational controls`.

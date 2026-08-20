@@ -67,7 +67,7 @@ Stated first, deliberately. Out of scope, not attempted:
 | `Limit { tif: Gtc }` | Match what it can, rest the remainder |
 | `Limit { tif: Ioc }` | Match what it can, discard the remainder |
 | `Limit { tif: Fok }` | Match in full immediately, or reject with zero fills |
-| `Limit { tif: PostOnly }` | Reject if it would cross; otherwise rest in full |
+| `Limit { tif: PostOnly }` | Reject if it would cross **after** self-trade prevention; otherwise rest in full |
 | `Market` | IOC semantics with an unbounded limit |
 
 Market order in a thin book: **partial-fill-and-discard**, never reject. Fills
@@ -149,6 +149,39 @@ replay outright.
 Ordering by `OrderId` was considered and rejected: nothing in the system depends
 on mass-cancel ordering beyond determinism, and imposing it would cost a sort on
 an operation that has no reason to pay for one.
+
+### PostOnly and self-trade prevention ordering
+
+PostOnly's crossing check is evaluated **after** STP would have applied, not
+against the raw book. Concretely: if a PostOnly order would only cross a
+resting order belonging to the *same* account, STP cancels that resting order
+first, nothing remains to cross, and the PostOnly order rests. It does not
+reject `WouldCross`.
+
+This is **not** FOK's precheck, and must not reuse it. FOK's `is_fillable`
+traversal is deliberately read-only — it exists to buy certainty *before*
+mutating (§6), because FOK needs to know whether it can fill in full before
+committing to anything. PostOnly has no such constraint: cancelling a
+same-account resting order is a decision it can commit to immediately, there
+is no partial-fill state to protect. Reusing the read-only traversal for
+PostOnly would leave the same-account resting order untouched whenever the
+only crossing depth was self-owned — both orders would then rest at crossing
+prices, violating "locked and crossed books are structurally impossible" and
+the `assert_invariants()` check that best bid strictly < best ask always
+holds, with no same-account exception.
+
+Implemented as: PostOnly's check walks the crossing levels on the opposite
+side, in the same price-time order a real sweep would. A same-account resting
+order encountered during the walk is cancelled for real via the ordinary
+cancel-resting path — same unlink, same `Cancelled` event — not merely
+excluded from a count. The walk continues past it. A foreign resting order
+encountered during the walk stops the check immediately: the PostOnly order
+rejects `WouldCross`, and any same-account cancellations already performed
+earlier in the walk stand — they are not reversed, since STP removing a
+self-trade risk is correct regardless of what the order ultimately does. If
+the walk reaches the end of crossing depth without finding any foreign order,
+the PostOnly order rests in full. No foreign quantity is ever matched or
+consumed by a PostOnly order under any outcome.
 
 ### Self-trade prevention
 
@@ -433,6 +466,15 @@ simpler to verify but more aggressive.
 Observed **inside the matching loop**, not only at ingress — an order already in
 the channel when the switch is thrown must still be rejected.
 
+`CancelReplace` during drain is **blocked**, treated as an amend rather than
+cancel-adjacent — consistent with §2's own modify rationale, which treats any
+quantity increase or price change as a new economic commitment. Drain halts new
+commitments; a `Modify` that increases size or reprices is one, even against an
+order that predates the drain. `Cancel` (pure removal) remains allowed, and a
+`Modify` that only decreases quantity is allowed for the same reason a decrease
+retains priority elsewhere in §2 — it strictly reduces exposure, never adds to
+it.
+
 ### Per-account limits
 
 Configured in `risk.toml`, with defaults baked in so `docker compose up` needs
@@ -443,12 +485,30 @@ no setup:
 
 **Market orders carry `price = 0` on the wire (§2), which the notional formula
 below would otherwise read as zero notional regardless of size — an unbounded
-market order is the more dangerous case, not an exempt one.** For notional
-purposes only, a Market order's price is the same reference price used for the
-price band: last trade, else book mid if both sides have depth. If neither
-exists, the book has never traded and has no two-sided depth, and a Market
-order is rejected with `NotFullyFillable` rather than let through uncapped —
-there is nothing for it to fill against in that state regardless.
+market order is the more dangerous case, not an exempt one.**
+
+The reference price for a Market order's notional is resolved differently from
+the price band's, because the two checks depend on different things. The band
+needs a mid, which needs both sides. A market order only needs depth on the
+side it sweeps — §2's "partial-fill-and-discard, never reject" rule is
+unconditional on exactly that basis, and the notional check must not contradict
+it.
+
+Resolution, in order:
+
+1. Last trade price, if any trade has occurred.
+2. Otherwise, the best price on the side the order would sweep (best ask for a
+   buy, best bid for a sell) — this exists whenever the order has anything to
+   fill against at all.
+3. Otherwise there is no depth on the relevant side and nothing to fill, and
+   the order is rejected `NotFullyFillable` — the same outcome §2 already
+   describes for an empty book on that side, not a new rejection this check
+   invents.
+
+Case 3 is not a notional-specific rejection — it is the pre-existing "nothing to
+fill against" case restated. A Market order with real depth to sweep is never
+rejected for notional reasons before it has a chance to fill; it is capped
+against the price it will actually trade near, not blocked pre-emptively.
 
 Notional is **gross**: `price × qty` summed across *all* the account's resting
 orders regardless of side, plus the incoming order, read in O(1) from
@@ -530,7 +590,8 @@ The README carries the full taxonomy as a table.
   order at the matching thread. The invariant holds *because* of single-writer
   architecture; the test proves the concurrency is real rather than avoided.
 - Replay from a recorded stream produces identical output
-- Sequence numbers strictly monotonic across all outbound streams
+- Each stream's `StreamSeq` is strictly monotonic **within that stream**
+  (§2) — there is no single counter monotonic across streams
 
 ### Property tests
 
