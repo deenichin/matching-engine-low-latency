@@ -337,6 +337,17 @@ its stream's counter as it writes them; the market data thread stamps `Trade`
 and `BookUpdate` with its own, independent counter as it writes them. Neither
 counter is touched by the matching thread.
 
+Routing an event back to a connection is not "reply to whoever sent the
+triggering command": a fill, an STP cancellation, or a `MassCancel` can
+produce events for a resting order that belongs to a *different* connection
+than the one that triggered the match. The gateway thread's return path keeps
+a `(AccountId, OrderId) -> ConnId` association, updated as orders start and
+stop resting, and refreshed on every amend to whichever connection issued it.
+This assumes an account may hold more than one connection open at once —
+amending from a different connection than the one an order originally rested
+on is a legitimate re-association, not an error, and later events for that
+order follow whichever connection most recently touched it.
+
 **Market data thread** owns the market-data socket and its subscribers. It
 drains a bounded channel fed by the matching thread and writes to each
 subscriber.

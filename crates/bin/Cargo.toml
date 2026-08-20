@@ -8,3 +8,5 @@ name = "engine"
 path = "src/main.rs"
 
 [dependencies]
+core = { path = "../core" }
+gateway = { path = "../gateway" }

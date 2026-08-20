@@ -14,6 +14,7 @@
 pub mod account;
 pub mod arena;
 pub mod book;
+pub mod engine;
 pub mod error;
 pub mod event;
 pub mod level;
@@ -22,6 +23,7 @@ pub mod types;
 pub use account::AccountEntry;
 pub use arena::{Arena, Node};
 pub use book::Book;
+pub use engine::Engine;
 pub use error::RejectReason;
 pub use event::{Command, Event};
 pub use level::Level;
