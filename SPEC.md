@@ -264,6 +264,12 @@ plane: `KillSwitch`, `Snapshot`.
 Orders carry: `order_id`, `account_id`, `side`, `price`, `qty`, `order_type`,
 `tif`, `client_ts`. The gateway stamps `recv_ts` on arrival.
 
+*(Tracked gap, stage 6: `recv_ts` is not yet implemented — no field carries it
+on `Command` today. `--exclude-timestamps` (§7) ships as a documented no-op
+until it does; deliberately deferred rather than added as a mechanical
+side-effect of stage 6, since it is real scope stage 6's plan never called
+for touching `Command`.)*
+
 ### Outbound messages
 
 Seven wire message types, one tag per `core::Event` variant — `Accepted`,

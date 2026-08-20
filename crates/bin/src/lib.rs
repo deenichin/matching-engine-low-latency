@@ -3,11 +3,16 @@
 //! (SPEC §4): `gateway`'s order-entry and matching threads, `risk`'s
 //! state, and `marketdata`'s subscriber thread, all wired together.
 
+use std::fs::File;
+use std::io::BufWriter;
 use std::path::Path;
 use std::sync::mpsc;
 
 use gateway::{Transport, UdsTransport, run_matching_thread, run_order_entry};
 use risk::{RiskConfig, RiskState};
+
+mod replay;
+pub use replay::{ReplayOutput, replay_file};
 
 /// Placeholder channel capacities. Bounded and pre-allocated, per
 /// CLAUDE.md — the actual numbers are a stage 7 benchmarking concern.
@@ -21,7 +26,17 @@ const MARKET_DATA_CHANNEL_CAPACITY: usize = 1024;
 /// failure — a test wanting to assert on that failure instead should call
 /// `UdsTransport::bind`/`marketdata::bind` itself rather than go through
 /// this function.
-pub fn run(order_entry_path: &Path, market_data_path: &Path, risk_config_path: &Path) {
+///
+/// `record_path`, when `Some`, opens that file and passes it to the
+/// matching thread as its stage-6 recording sink (SPEC §7) — the
+/// post-gateway-validation, pre-risk `Command` sequence. `None` (the
+/// default) records nothing, at zero cost to the hot path.
+pub fn run(
+    order_entry_path: &Path,
+    market_data_path: &Path,
+    risk_config_path: &Path,
+    record_path: Option<&Path>,
+) {
     let transport = match UdsTransport::bind(order_entry_path) {
         Ok(transport) => transport,
         Err(e) => {
@@ -47,6 +62,14 @@ pub fn run(order_entry_path: &Path, market_data_path: &Path, risk_config_path: &
     let risk_config = RiskConfig::load(risk_config_path);
     let risk_state = RiskState::new(risk_config);
 
+    let recorder = record_path.map(|path| match File::create(path) {
+        Ok(file) => BufWriter::new(file),
+        Err(e) => {
+            eprintln!("failed to open recording file at {}: {e}", path.display());
+            std::process::exit(1);
+        }
+    });
+
     let (command_tx, command_rx) = mpsc::sync_channel(COMMAND_CHANNEL_CAPACITY);
     let (return_tx, return_rx) = mpsc::sync_channel(RETURN_CHANNEL_CAPACITY);
     let (market_data_tx, market_data_rx) = mpsc::sync_channel(MARKET_DATA_CHANNEL_CAPACITY);
@@ -58,6 +81,7 @@ pub fn run(order_entry_path: &Path, market_data_path: &Path, risk_config_path: &
             return_tx_for_matching,
             market_data_tx,
             risk_state,
+            recorder,
         )
     });
 

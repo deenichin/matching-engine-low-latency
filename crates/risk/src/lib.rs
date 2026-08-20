@@ -16,9 +16,29 @@ mod config;
 pub use config::RiskConfig;
 
 use core::Book;
+use core::Engine;
 use core::error::RejectReason;
 use core::event::{Command, Event};
 use core::types::{AccountId, OrderId, OrderKind, Price, Side, Tif};
+
+/// Runs one command through the exact risk-then-matching path live traffic
+/// uses: risk first, and only if risk permits, `Engine::apply` (SPEC §5).
+/// Replay (stage 6, SPEC §7) calls this same function against a fresh
+/// `Engine`/`RiskState` rather than a parallel reimplementation, so a
+/// command rejected live is guaranteed to be rejected identically on
+/// replay -- not just "expected to," by construction.
+pub fn process_command(
+    engine: &mut Engine,
+    risk_state: &mut RiskState,
+    cmd: Command,
+    emit: &mut dyn FnMut(Event),
+) {
+    if let Some(rejected) = risk_state.pre_apply_check(&cmd, engine.book()) {
+        emit(rejected);
+        return;
+    }
+    engine.apply(cmd, emit);
+}
 
 /// Kill switch + per-account limits + price band, owned by the matching
 /// thread and checked before every `Engine::apply` call (SPEC §5).

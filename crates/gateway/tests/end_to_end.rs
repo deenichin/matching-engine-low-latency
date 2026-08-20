@@ -5,8 +5,8 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, Mutex, mpsc};
 use std::time::Duration;
 
 use core::event::{Command, Event};
@@ -39,10 +39,39 @@ fn spawn_gateway() -> PathBuf {
             return_tx_for_matching,
             market_data_tx,
             risk_state,
+            None,
         )
     });
 
     path
+}
+
+/// Like `spawn_gateway`, but also returns the market-data receiver instead
+/// of discarding it -- for tests that need to observe `BookUpdate`s
+/// directly (checking the book never crosses) rather than only inferring
+/// state from execution reports.
+fn spawn_gateway_with_market_data() -> (PathBuf, mpsc::Receiver<Event>) {
+    let path = test_socket_path();
+    let transport = UdsTransport::bind(&path).expect("bind should succeed");
+
+    let (command_tx, command_rx) = mpsc::sync_channel(64);
+    let (return_tx, return_rx) = mpsc::sync_channel(64);
+    let (market_data_tx, market_data_rx) = mpsc::sync_channel::<Event>(64);
+
+    let return_tx_for_matching = return_tx.clone();
+    let risk_state = risk::RiskState::new(risk::RiskConfig::default());
+    std::thread::spawn(move || run_order_entry(transport, command_tx, return_tx, return_rx));
+    std::thread::spawn(move || {
+        run_matching_thread(
+            command_rx,
+            return_tx_for_matching,
+            market_data_tx,
+            risk_state,
+            None,
+        )
+    });
+
+    (path, market_data_rx)
 }
 
 fn connect(path: &PathBuf) -> UnixStream {
@@ -60,6 +89,31 @@ fn send_new_order(client: &mut UnixStream, account_id: u64, order_id: u64, price
             account_id: AccountId(account_id),
             order_id: OrderId(order_id),
             side: Side::Buy,
+            price: Price(price),
+            qty: Qty(qty),
+            kind: OrderKind::Limit,
+            tif: Tif::Gtc,
+            client_ts: 0,
+        },
+        &mut buf,
+    );
+    client.write_all(&buf[..len]).expect("client write failed");
+}
+
+fn send_new_order_side(
+    client: &mut UnixStream,
+    account_id: u64,
+    order_id: u64,
+    side: Side,
+    price: u64,
+    qty: u64,
+) {
+    let mut buf = [0u8; wire::MAX_MESSAGE_LEN];
+    let len = wire::encode_command(
+        &Command::NewOrder {
+            account_id: AccountId(account_id),
+            order_id: OrderId(order_id),
+            side,
             price: Price(price),
             qty: Qty(qty),
             kind: OrderKind::Limit,
@@ -267,5 +321,161 @@ fn malformed_input_is_rejected_without_reaching_the_matching_thread() {
             order_id: OrderId(1),
             resting_qty: Qty(5),
         }
+    );
+}
+
+/// Gated variant (SPEC §6, PLAN.md stage 6 item 6): proves priority is
+/// preserved once arrival order is known. `N` real threads, each owning
+/// its own real socket connection, turn-gated by a shared counter so each
+/// thread's send-then-await-`Accepted` happens in a known order -- the
+/// gate controls *when* each thread is allowed to send, not the socket
+/// I/O itself, which is real throughout.
+///
+/// Verification deliberately avoids racing N reader threads against each
+/// other to observe "which maker's fill arrived first": that would only
+/// measure which OS thread got scheduled first to acquire a shared lock,
+/// not the dispatcher's actual write order, and is exactly the kind of
+/// flaky signal this test must not depend on. Instead, each maker offers
+/// a *distinct* quantity (1, 2, 3, ..., N), so the sequence of `qty`
+/// values in the taker's own `Filled` events -- read from a single
+/// connection, in guaranteed program order, no cross-socket racing at all
+/// -- directly encodes which maker was consumed at each step of the
+/// sweep.
+#[test]
+fn concurrent_submissions_are_matched_in_strict_arrival_order() {
+    const N: usize = 5;
+    let path = spawn_gateway();
+    let turn = Arc::new(AtomicUsize::new(0));
+
+    let handles: Vec<_> = (0..N)
+        .map(|i| {
+            let path = path.clone();
+            let turn = Arc::clone(&turn);
+            std::thread::spawn(move || {
+                let mut conn = connect(&path);
+                while turn.load(Ordering::Acquire) != i {
+                    std::hint::spin_loop();
+                }
+                let qty = i as u64 + 1;
+                send_new_order_side(&mut conn, 100 + i as u64, 1, Side::Sell, 100, qty);
+                let (_seq, event) = read_one_event(&mut conn);
+                assert!(
+                    matches!(event, Event::Accepted { resting_qty, .. } if resting_qty.0 == qty)
+                );
+                turn.store(i + 1, Ordering::Release);
+                conn
+            })
+        })
+        .collect();
+    // Keep the maker connections alive (dropping would close the socket
+    // before the dispatcher writes their Filled event) but nothing further
+    // needs to be read from them for this test.
+    let _maker_conns: Vec<UnixStream> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+    // All N makers rested in the order 0..N, each with its own distinct
+    // quantity (proven above via the turn gate + Accepted resting_qty). A
+    // single taker now crosses all of them at once.
+    let total_qty: u64 = (1..=N as u64).sum();
+    let mut taker = connect(&path);
+    send_new_order_side(&mut taker, 999, 1, Side::Buy, 100, total_qty);
+
+    let mut fill_qtys = Vec::with_capacity(N);
+    for _ in 0..N {
+        let (_seq, event) = read_one_event(&mut taker);
+        match event {
+            Event::Filled { qty, .. } => fill_qtys.push(qty.0),
+            other => panic!("expected a Filled event, got {other:?}"),
+        }
+    }
+    let (_seq, event) = read_one_event(&mut taker);
+    assert!(matches!(event, Event::Accepted { resting_qty, .. } if resting_qty.0 == 0));
+
+    let expected: Vec<u64> = (1..=N as u64).collect();
+    assert_eq!(
+        fill_qtys,
+        expected,
+        "fills must reflect strict rest arrival order (maker 0's qty=1 consumed first, ..., maker {}'s qty={N} consumed last), got {fill_qtys:?}",
+        N - 1
+    );
+}
+
+/// Ungated variant: genuinely uncoordinated concurrent submission -- N
+/// real threads, N real connections, all released together with no
+/// ordering between them. Since arrival order is neither known nor
+/// controlled here, only order-independent properties are asserted: no
+/// double-fill / fills conserved per account, every order eventually
+/// fully fills (guaranteed since total buy volume equals total sell
+/// volume at one price, regardless of arrival order), and the book is
+/// never observed crossed.
+#[test]
+fn concurrent_submissions_with_no_ordering_gate_preserve_book_invariants() {
+    const PAIRS: usize = 5;
+    let (path, market_data_rx) = spawn_gateway_with_market_data();
+
+    let crossed = Arc::new(Mutex::new(Vec::new()));
+    {
+        let crossed = Arc::clone(&crossed);
+        std::thread::spawn(move || {
+            for event in market_data_rx {
+                if let Event::BookUpdate {
+                    best_bid: Some((bid, _)),
+                    best_ask: Some((ask, _)),
+                } = event
+                    && bid.0 >= ask.0
+                {
+                    crossed.lock().unwrap().push((bid, ask));
+                }
+            }
+        });
+    }
+
+    let barrier = Arc::new(Barrier::new(PAIRS * 2));
+    let handles: Vec<_> = (0..PAIRS * 2)
+        .map(|i| {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            let side = if i < PAIRS { Side::Buy } else { Side::Sell };
+            let account = 200 + i as u64;
+            std::thread::spawn(move || {
+                let mut conn = connect(&path);
+                barrier.wait();
+                send_new_order_side(&mut conn, account, 1, side, 100, 1);
+
+                let mut filled = 0u64;
+                let mut resting = 1u64;
+                while resting > 0 {
+                    let (_seq, event) = read_one_event(&mut conn);
+                    match event {
+                        Event::Accepted { resting_qty, .. } => resting = resting_qty.0,
+                        Event::Filled { qty, resting_qty, .. } => {
+                            filled += qty.0;
+                            resting = resting_qty.0;
+                        }
+                        other => panic!("unexpected event for a simple {side:?} order: {other:?}"),
+                    }
+                    assert_eq!(
+                        filled + resting,
+                        1,
+                        "no double-fill: filled + resting must always equal submitted qty"
+                    );
+                }
+                assert_eq!(
+                    resting, 0,
+                    "with equal buy and sell volume at one price, every order must eventually fully fill"
+                );
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // Give the market-data drain a brief moment to catch up, then check
+    // whether it ever observed a crossed book.
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        crossed.lock().unwrap().as_slice(),
+        &[],
+        "book must never be observed crossed, even under fully uncoordinated concurrent submission"
     );
 }

@@ -32,7 +32,7 @@ fn spawn_daemon() -> (PathBuf, PathBuf) {
 
     let oe = order_entry_path.clone();
     let md = market_data_path.clone();
-    std::thread::spawn(move || bin::run(&oe, &md, &risk_config_path));
+    std::thread::spawn(move || bin::run(&oe, &md, &risk_config_path, None));
 
     (order_entry_path, market_data_path)
 }

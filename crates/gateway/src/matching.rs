@@ -25,6 +25,8 @@
 //! triggered it.
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 
 use core::types::{AccountId, MAX_OPEN_ORDERS, OrderId};
@@ -114,19 +116,26 @@ fn event_id(event: &Event) -> Option<(AccountId, OrderId)> {
 /// when the kill switch fires is still checked against the new state
 /// (SPEC §5). It is `&mut` because a `KillSwitch` command updates it.
 ///
-/// `market_data_tx` is stage 5's channel, stubbed here: `Trade` and
-/// `BookUpdate` events get routed to it via `try_send` (never blocking,
-/// since nothing consumes it yet), while every other event goes to
-/// `return_tx` addressed by the connection its own account/order last
-/// rested from. Nothing in `Book` emits `Trade`/`BookUpdate` yet (that
-/// lands with stage 5's marketdata work), so that arm is currently
-/// unreachable but already correct — stage 5 does not need to touch this
-/// loop again.
+/// `market_data_tx` routes `Trade` and `BookUpdate` events to the
+/// marketdata thread via `try_send` (never blocking — a slow or absent
+/// subscriber side must never stall matching, SPEC §8), while every other
+/// event goes to `return_tx` addressed by the connection its own
+/// account/order last rested from.
+///
+/// `recorder`, when `Some`, is stage 6's recording hook (SPEC §7): each
+/// command is written here — post-gateway-validation, before risk, exactly
+/// as SPEC specifies — via the same self-framing `wire::encode_command`
+/// format live traffic already uses on the wire, so replay can read it back
+/// with the existing `Framer`/`decode_command` rather than a parallel
+/// format. This is deliberately opt-in I/O on the matching thread: it is
+/// not part of the zero-allocation hot-path guarantee, which only applies
+/// when recording is off (the default).
 pub fn run_matching_thread(
     command_rx: Receiver<(ConnId, Command)>,
     return_tx: SyncSender<(ConnId, Event)>,
     market_data_tx: SyncSender<Event>,
     mut risk_state: risk::RiskState,
+    mut recorder: Option<BufWriter<File>>,
 ) {
     let mut engine = Engine::new();
     let mut resting_conn: HashMap<(AccountId, OrderId), ConnId> =
@@ -142,14 +151,19 @@ pub fn run_matching_thread(
             Err(TryRecvError::Disconnected) => break,
         };
 
-        if let Some(rejected) = risk_state.pre_apply_check(&cmd, engine.book()) {
-            let _ = return_tx.send((conn_id, rejected));
-            continue;
+        if let Some(writer) = recorder.as_mut() {
+            let mut buf = [0u8; wire::MAX_MESSAGE_LEN];
+            let len = wire::encode_command(&cmd, &mut buf);
+            // Recording is a best-effort diagnostic feature, not part of
+            // the reliability contract of order processing itself -- a
+            // write failure here must never stop a command from being
+            // matched.
+            let _ = writer.write_all(&buf[..len]);
         }
 
         let self_id = command_self_id(&cmd);
 
-        engine.apply(cmd, &mut |event| {
+        risk::process_command(&mut engine, &mut risk_state, cmd, &mut |event| {
             if matches!(event, Event::Trade { .. } | Event::BookUpdate { .. }) {
                 let _ = market_data_tx.try_send(event);
                 return;
@@ -214,7 +228,7 @@ mod tests {
         let (market_data_tx, _market_data_rx) = mpsc::sync_channel::<Event>(16);
         let risk_state = risk::RiskState::new(risk::RiskConfig::default());
         std::thread::spawn(move || {
-            run_matching_thread(command_rx, return_tx, market_data_tx, risk_state)
+            run_matching_thread(command_rx, return_tx, market_data_tx, risk_state, None)
         });
         (command_tx, return_rx)
     }
