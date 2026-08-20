@@ -18,4 +18,5 @@ pub enum RejectReason {
     MaxOpenOrders = 8,
     MaxNotional = 9,
     PriceBandViolation = 10,
+    ZeroPrice = 11,
 }

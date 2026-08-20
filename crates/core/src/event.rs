@@ -52,7 +52,7 @@ pub enum Command {
 /// the taker, plus possibly a `Cancelled` from self-trade prevention. Each
 /// is sent individually, never collected into a `Vec`, per the channel
 /// design in SPEC §4.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
     /// The taker side of a submit that did not fill in full: whatever
     /// remains rests at `resting_qty` (zero for an IOC or Market order that

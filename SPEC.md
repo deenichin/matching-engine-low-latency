@@ -266,13 +266,24 @@ Orders carry: `order_id`, `account_id`, `side`, `price`, `qty`, `order_type`,
 
 ### Outbound messages
 
-**Execution reports** carry: `order_id`, `stream_seq` (this stream's counter,
-per §2), state (`accepted` / `rejected` / `partially_filled` / `filled` /
-`cancelled`), fill `price` and `qty`, and a `reason` code on reject.
+Seven wire message types, one tag per `core::Event` variant — `Accepted`,
+`Rejected`, `Filled`, `Cancelled`, `Replaced`, `Trade`, `BookUpdate` — not
+a single message with a discriminant `state` field. `core::Event` is
+already seven distinct variants (§4); giving each its own wire tag keeps
+wire's "no parallel type hierarchy" promise on the outbound side, the same
+as `Command` on the inbound side.
 
-**Market data**: `Trade` prints on every execution; `BookUpdate` (top-of-book)
-on every book change. Both carry monotonic sequence numbers so a subscriber can
-detect gaps.
+**Execution reports** — `Accepted`, `Rejected`, `Filled`, `Cancelled`,
+`Replaced` — each carry `order_id`, `account_id`, and `stream_seq` (this
+stream's counter, per §2), plus their own variant-specific fields:
+`resting_qty` on `Accepted`; a `reason` code on `Rejected`; fill `price`,
+`qty`, and `resting_qty` on `Filled`; `new_qty` and `priority_retained` on
+`Replaced`.
+
+**Market data** — `Trade`, `BookUpdate` — `Trade` prints on every
+execution; `BookUpdate` (top-of-book) prints on every book change. Both
+carry their own stream's `stream_seq` (§2, §8) so a subscriber can detect
+gaps.
 
 ### Validation
 
@@ -318,6 +329,13 @@ command channel rather than blocking, avoiding futex wake and context-switch
 jitter in the tail. Per iteration: check kill switch, check risk, call
 `Engine::apply`, dispatch events to the gateway return channel and the market
 data channel. Pinned to a dedicated core (§10).
+
+The events the matching thread dispatches carry no `stream_seq` — `core::Event`
+doesn't know about streams (§2). Each `StreamSeq` is stamped by the thread that
+owns the destination stream: the gateway thread stamps execution reports with
+its stream's counter as it writes them; the market data thread stamps `Trade`
+and `BookUpdate` with its own, independent counter as it writes them. Neither
+counter is touched by the matching thread.
 
 **Market data thread** owns the market-data socket and its subscribers. It
 drains a bounded channel fed by the matching thread and writes to each
@@ -580,8 +598,11 @@ entry, so banded resting prices bound market-order fills transitively.
 
 A single `RejectReason` enum, exhaustive, each variant with a distinct wire
 value: `MalformedMessage`, `UnknownMessageType`, `DuplicateOrderId`,
-`UnknownOrderId`, `ZeroQuantity`, `WouldCross`, `NotFullyFillable`,
-`KillSwitchActive`, `MaxOpenOrders`, `MaxNotional`, `PriceBandViolation`.
+`UnknownOrderId`, `ZeroQuantity`, `ZeroPrice`, `WouldCross`,
+`NotFullyFillable`, `KillSwitchActive`, `MaxOpenOrders`, `MaxNotional`,
+`PriceBandViolation`. `ZeroPrice` is distinct from `ZeroQuantity` — a
+zero-price non-`Market` order (§2, §3) is a specific, nameable violation of
+"price nonzero except for `Market`," not a generic `MalformedMessage`.
 
 The README carries the full taxonomy as a table.
 
