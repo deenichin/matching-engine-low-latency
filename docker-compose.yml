@@ -1,0 +1,5 @@
+services:
+  app:
+    build: .
+    image: onebalance-task:local
+    container_name: onebalance-task
