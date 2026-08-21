@@ -7,3 +7,4 @@ edition.workspace = true
 core = { path = "../core" }
 wire = { path = "../wire" }
 risk = { path = "../risk" }
+core_affinity = "0.8"

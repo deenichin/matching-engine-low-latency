@@ -731,24 +731,35 @@ Matching policies above.
   is separately out of scope — this build implements the inspection half
   only, not the seed-a-replay-from-here half.
 
-**Only the matching thread does either of these today, and only one of
-the two (busy-spinning; SPEC §4) — the gateway, market-data, and
-return-dispatcher threads all still block on their reads/channel
-receives, and no thread, including the matching thread, is pinned to a
-dedicated core yet (stage 9, SPEC §10, Extension slice, not yet built as
-of this writing).** The two mechanisms aren't equal contributors to the
-latency number. Busy-spinning does the heavy lifting: it eliminates the
-wake-up latency of blocking on a read or channel receive — the kernel
-marking a thread not-runnable, waiting for a wake signal, then
-rescheduling it — which is the dominant cost in the four-thread-wake-up
-chain BENCH.md's Docker reproduction section describes (matching logic
-itself is roughly 1% of the measured per-message time; the rest is socket
-syscalls and OS scheduling). Pinning's role is narrower: it mainly
-prevents the OS scheduler from migrating a spinning thread mid-run
-(losing its warm cache state) or preempting it to run something else —
-either of which would reintroduce the jitter spinning is meant to remove.
-Pinning is closer to a precondition for a *clean* spin than an equal
-contributor to the latency number by itself.
+**Only the matching thread does either of these — the gateway,
+market-data, and return-dispatcher threads all still block on their
+reads/channel receives and remain unpinned.** The matching thread both
+busy-spins (SPEC §4) *and* is pinned to a dedicated core (stage 9, SPEC
+§10), via `core_affinity` rather than a raw `sched_setaffinity` FFI call
+(`gateway::matching::pin_to_dedicated_core`) — CLAUDE.md permits `unsafe`
+here as the one named FFI/hardware-boundary exception, but `core_affinity`
+wraps the platform call behind a safe API, so no `unsafe` was needed at
+all. The two mechanisms aren't equal contributors to the latency number.
+Busy-spinning does the heavy lifting: it eliminates the wake-up latency of
+blocking on a read or channel receive — the kernel marking a thread
+not-runnable, waiting for a wake signal, then rescheduling it — which is
+the dominant cost in the four-thread-wake-up chain BENCH.md's Docker
+reproduction section describes (matching logic itself is roughly 1% of
+the measured per-message time; the rest is socket syscalls and OS
+scheduling). Pinning's role is narrower: it mainly prevents the OS
+scheduler from migrating a spinning thread mid-run (losing its warm cache
+state) or preempting it to run something else — either of which would
+reintroduce the jitter spinning is meant to remove. Pinning is closer to a
+precondition for a *clean* spin than an equal contributor to the latency
+number by itself.
+
+Measured pinned-vs-unpinned HDR distributions, and an important caveat
+about what pinning actually proves inside this development machine's
+Docker Desktop environment, are in BENCH.md's "CPU pinning: pinned vs.
+unpinned" section — not repeated here in full, since the honest
+conclusion (no consistent tail-latency benefit was measurable in this
+particular virtualized environment, for reasons BENCH.md explains) is more
+useful stated once, with the actual numbers next to it, than paraphrased.
 
 A real low-latency deployment would both spin and pin every thread in the
 hot path, not just one. That isn't done here because dedicating
@@ -757,10 +768,10 @@ handful of symbols, and because the real fix for socket-syscall overhead
 is kernel-bypass (DPDK, already described as future work against the
 `Transport` trait in the Architecture section above), not spinning more
 threads around the same syscalls. Full pin-and-spin plus kernel-bypass
-together is what a production low-latency venue would actually run;
-stage 9's plan is to pin and spin the one thread where it matters most
-for the specific requirement (SPEC §9's zero-or-near-zero-allocation,
-low-jitter hot path), not to apply it uniformly across all four.
+together is what a production low-latency venue would actually run; this
+build pins and spins the one thread where it matters most for the
+specific requirement (SPEC §9's zero-or-near-zero-allocation, low-jitter
+hot path), not uniformly across all four.
 
 ---
 

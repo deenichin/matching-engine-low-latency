@@ -12,7 +12,7 @@ document states methodology alongside every figure, not the figure alone.
 | OS | Darwin 25.5.0 (macOS), arm64 |
 | Rust | rustc 1.91.1, cargo 1.91.1 |
 | Build profile | `cargo bench` (criterion, `opt-level` release-equivalent); `cargo run -p bench --release` |
-| CPU pinning | **Not enabled.** Pinning is stage 9 (SPEC §10, Extension slice) and hasn't been built yet — every number below runs on whatever core the OS scheduler happens to place each thread on. Treat the HDR figures as an unpinned baseline, not the pinned target number. |
+| CPU pinning | **Enabled by default** (stage 9, SPEC §10): the matching thread pins itself to a dedicated core via `core_affinity` (`gateway::matching::pin_to_dedicated_core`), gated off by `MATCHING_PIN=0` for comparison. Real and enforced inside the Linux containers (`engine`/`dev`, `cpuset: "0-3"`); on the bare macOS host used for the earlier criterion/HDR figures above, `core_affinity`'s call succeeds but macOS is not required to honor the affinity hint the way Linux's `sched_setaffinity` does — those host numbers were never pinned in any enforced sense, pinning or not. See "CPU pinning: pinned vs. unpinned" below for the measured comparison and its caveats. |
 
 Two independent measurement tools, deliberately different in shape:
 
@@ -186,6 +186,100 @@ out of scope for this stage. The harness's accounting makes this
 impossible to hide: `sent`/`matched`/`unmatched` are always printed as
 hard counts, not only when something is wrong, specifically so a lossy run
 can never look identical to a clean one.
+
+### CPU pinning: pinned vs. unpinned (stage 9)
+
+The matching thread pins itself to a dedicated core via `core_affinity`
+(`gateway::matching::pin_to_dedicated_core`) — chosen over a raw
+`sched_setaffinity` FFI call specifically so this codebase needs no
+`unsafe` at all for it, even though CLAUDE.md would permit `unsafe` here
+as the one named FFI/hardware-boundary exception. The pin target is
+simply the *first* core id the OS reports as available to the process —
+taken, not chosen for any property of that core; the pin-success log line
+(`matching-engine: matching thread pinned to core N`) reports whichever id
+that turned out to be, not a selection made for a reason.
+
+Pinning is on by default and gated off by an environment variable read
+once at matching-thread startup, `MATCHING_PIN=0`, so both distributions
+below come from **one binary**, reproducible verbatim by anyone with these
+two commands — not two separately-built binaries from a temporarily
+edited call site, which nobody could rebuild identically afterward:
+
+```sh
+docker compose run --rm dev cargo run -p bench --release -- --messages 1000000
+docker compose run --rm -e MATCHING_PIN=0 dev cargo run -p bench --release -- --messages 1000000
+```
+
+Run inside the `dev` container, not the bare macOS host, because real,
+*enforced* pinning is Linux-only: `sched_setaffinity` (which
+`core_affinity` calls under the hood on Linux) is honored by the kernel;
+on bare macOS, the equivalent call reports success but the OS is not
+required to actually honor the affinity hint. `docker-compose.yml` gives
+both `engine` and `dev` `cpuset: "0-3"` — four cores, not one, because the
+daemon runs four threads (gateway, matching, market-data,
+return-dispatcher) plus the runtime; a single-core cpuset would force all
+of them to timeshare one core, which is contention, not a dedicated core,
+and would make the pinned run look *worse* than unpinned for reasons
+having nothing to do with pinning.
+
+**Three runs of each, same command, same container, same cpuset, same
+1,000,000-message/200,000 msg/s/50,000-warmup workload:**
+
+| run | condition | matched/sent | wall clock | sustained | p50 (µs) | p99 (µs) | p99.9 (µs) | p99.99 (µs) | max (µs) |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | pinned | 1,000,000 / 1,000,000 | 5.000 s | 199,993 msg/s | 103.551 | 220.543 | 527.871 | 1116.159 | 1343.487 |
+| 2 | pinned | 1,000,000 / 1,000,000 | 5.000 s | 199,993 msg/s | 103.807 | 225.023 | 550.911 | 1028.607 | 1191.935 |
+| 3 | pinned | 999,999 / 1,000,000 | 35.154 s | 28,446 msg/s | 104.383 | 224.895 | 342.271 | 893.951 | 1203.199 |
+| 1 | unpinned (`MATCHING_PIN=0`) | 999,998 / 1,000,000 | 35.155 s | 28,445 msg/s | 104.639 | 218.239 | 311.295 | 823.295 | 1121.279 |
+| 2 | unpinned (`MATCHING_PIN=0`) | 1,000,000 / 1,000,000 | 5.000 s | 199,998 msg/s | 102.719 | 218.111 | 314.623 | 705.535 | 861.183 |
+| 3 | unpinned (`MATCHING_PIN=0`) | 1,000,000 / 1,000,000 | 5.000 s | 199,993 msg/s | 102.847 | 222.719 | 587.775 | 2846.719 | 3291.135 |
+
+**Honest reading: no consistent tail-latency benefit from pinning is
+observable in this environment, and one larger, unrelated effect swamps
+it.** Two things stand out, and neither is the clean "pinning helps the
+tail" story stage 9 might have hoped to find:
+
+1. **A throughput bimodality — 5.000s/~200,000 msg/s vs. ~35s/~28,400
+   msg/s — occurs under *both* conditions, uncorrelated with pinning.**
+   Runs 1–2 pinned and run 2–3 unpinned hit the fast mode; run 3 pinned
+   and run 1 unpinned hit the slow mode. If pinning caused this, it would
+   show up only on one side; it doesn't. This is very likely the same
+   effect BENCH.md's Docker-reproduction section already named (a smaller
+   effective socket send buffer inside Docker Desktop's Linux VM changing
+   queueing behavior run to run) rather than anything stage 9 introduced.
+   Disclosed here with hard numbers, not root-caused — a deeper
+   investigation into what specifically flips this mode is out of scope
+   for this stage, same discipline as the 25-message unmatched rate above.
+2. **Within the fast-throughput mode, run-to-run tail variance is larger
+   than any pinned-vs-unpinned difference.** Comparing only the four
+   fast-mode runs (pinned 1, 2; unpinned 2, 3): p50 and p99 are
+   statistically indistinguishable across all four (103–104 µs / 220–225
+   µs pinned vs. 103–103 µs / 218–223 µs unpinned — a ~1–2% difference,
+   well inside normal jitter). At p99.9/p99.99/max, pinned runs sit at
+   528–551 / 1029–1116 / 1192–1343 µs, while unpinned runs range from a
+   *better* 315 / 706 / 861 µs (run 2) to a *worse* 588 / 2847 / 3291 µs
+   (run 3) — a single unpinned run has the single worst tail in the whole
+   table. Three samples per condition is not enough to distinguish a real
+   effect this size from noise of this size, and this data doesn't try to.
+
+This is consistent with, not contrary to, the caveat named going in:
+**Docker Desktop's Linux VM has its own guest vCPUs scheduled onto
+physical Apple Silicon cores by the macOS hypervisor underneath it.** The
+pin is real and enforced at the *guest kernel* level — `sched_setaffinity`
+genuinely restricts the matching thread to one guest vCPU, confirmed by
+the `matching thread pinned to core N` log line appearing in every pinned
+run — but that guest vCPU is not itself guaranteed a fixed *physical*
+core the way bare-metal Linux with `isolcpus` would give. A guest-level
+pin that the hypervisor can still freely move across physical cores
+underneath is a substantially weaker claim than the "no scheduler
+migration, no preemption jitter" story pinning tells on bare metal, and
+the data above is consistent with that weaker claim actually holding: the
+guest-level affinity is real, but it isn't preventing the migration/
+preemption jitter it exists to prevent, because the layer doing the
+migrating (the hypervisor) is one level below what this pin controls.
+Measuring this properly would need bare-metal Linux with `isolcpus`
+reserving a genuinely fixed physical core — out of scope for what this
+development machine can produce.
 
 ---
 

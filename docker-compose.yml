@@ -1,8 +1,22 @@
+# `cpuset: "0-3"` on both services below (stage 9, SPEC §10) constrains
+# which of the Docker Desktop Linux VM's own guest vCPUs each container's
+# threads may run on -- it does not pin anything to physical host cores
+# directly (see BENCH.md's caveat: the VM's vCPUs are themselves scheduled
+# onto physical Apple Silicon cores by the macOS hypervisor underneath).
+# Four cores, not one: the daemon runs four threads (gateway, matching,
+# market-data, return-dispatcher) plus the Tokio-free std runtime, so a
+# single-core cpuset would force all of them to share one core --
+# contention that would make the matching thread's own pin to core 0 look
+# *worse* than no pinning at all, for reasons that have nothing to do with
+# pinning. `"0-3"` gives the container room; the matching thread pins
+# itself to whichever core id the OS reports as available within that
+# range (`gateway::matching::pin_to_dedicated_core`).
 services:
   engine:
     build: .
     image: onebalance-task:local
     container_name: onebalance-task
+    cpuset: "0-3"
     volumes:
       # Shared home for both UDS sockets (SPEC.md §3):
       #   /run/engine/order-entry.sock
@@ -22,6 +36,7 @@ services:
       context: .
       target: builder
     image: onebalance-task-dev:local
+    cpuset: "0-3"
 
 volumes:
   engine-sockets:

@@ -114,6 +114,62 @@ fn event_id(event: &Event) -> Option<(AccountId, OrderId)> {
     }
 }
 
+/// Environment variable that gates CPU pinning, read once at matching-
+/// thread startup. Defaults to on; `MATCHING_PIN=0` skips it. Exists so
+/// the pinned-vs-unpinned HDR comparison in BENCH.md (stage 9) is
+/// reproducible from one binary with two commands, rather than requiring
+/// two separately-built binaries that nobody could rebuild identically
+/// afterward.
+const MATCHING_PIN_ENV_VAR: &str = "MATCHING_PIN";
+
+/// Pins the calling thread to a dedicated CPU core (SPEC §10, stage 9), so
+/// the OS scheduler cannot migrate or preempt it mid-spin -- either of
+/// which would reintroduce the jitter busy-spinning (above) exists to
+/// remove. Must be called from the matching thread itself:
+/// `core_affinity::set_for_current` only ever affects the calling thread.
+///
+/// Uses `core_affinity` rather than a raw `sched_setaffinity` FFI call --
+/// CLAUDE.md permits `unsafe` only at FFI/hardware boundaries, naming CPU
+/// affinity as the one candidate, and `core_affinity` wraps the platform
+/// call behind a safe API, so no `unsafe` is needed here at all.
+///
+/// Pins to the *first* core id the OS reports as available to this
+/// process -- taken, not chosen for any property of that core. Inside the
+/// `engine`/`dev` containers that's the lowest id within whatever range
+/// `docker-compose.yml`'s `cpuset` grants the container, not necessarily
+/// physical core 0. `sched_setaffinity`'s real, enforced effect is
+/// Linux-only: on the bare macOS host this call does not panic or error,
+/// but the affinity is at best an unenforced scheduling hint (see
+/// BENCH.md for what was actually measured).
+///
+/// Never panics on failure (no core ids reported, or the OS rejects the
+/// affinity mask) -- pinning is a latency optimization, not a correctness
+/// requirement, so a failed pin must not prevent the matching thread from
+/// running at all. Also runs whenever `matching`'s own unit tests spawn
+/// `run_matching_thread` (below); harmless, since multiple threads can
+/// share a core, if a little more contended during `cargo test`.
+fn pin_to_dedicated_core() {
+    if std::env::var(MATCHING_PIN_ENV_VAR).as_deref() == Ok("0") {
+        eprintln!("matching-engine: MATCHING_PIN=0; matching thread left unpinned");
+        return;
+    }
+    let Some(core_id) = core_affinity::get_core_ids().and_then(|ids| ids.into_iter().next()) else {
+        eprintln!("matching-engine: no CPU core ids reported; matching thread not pinned");
+        return;
+    };
+    if core_affinity::set_for_current(core_id) {
+        eprintln!(
+            "matching-engine: matching thread pinned to core {}",
+            core_id.id
+        );
+    } else {
+        eprintln!(
+            "matching-engine: failed to pin matching thread to core {}; continuing unpinned",
+            core_id.id
+        );
+    }
+}
+
 /// Runs the matching thread on the calling thread. Returns when
 /// `command_rx` disconnects (every sender dropped) — the orderly shutdown
 /// path; there is no other exit.
@@ -144,6 +200,8 @@ pub fn run_matching_thread(
     mut risk_state: risk::RiskState,
     mut recorder: Option<BufWriter<File>>,
 ) {
+    pin_to_dedicated_core();
+
     let mut engine = Engine::new();
     let mut resting_conn: HashMap<(AccountId, OrderId), ConnId> =
         HashMap::with_capacity(RESTING_CONN_INITIAL_CAPACITY);
