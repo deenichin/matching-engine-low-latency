@@ -89,8 +89,9 @@ pub trait Transport: Sized {
 `UdsTransport` is the only implementation today (Unix Domain Socket,
 `SOCK_STREAM`, stale-socket-file unlink on bind, cleaned up on `Drop`).
 Ingress sits behind this trait so transport is a compile-time choice, not
-an architectural commitment — see "Kernel-bypass transport (DPDK)" below
-for the full design a second implementation would need.
+an architectural commitment — see "Kernel-bypass transport (DPDK)" near
+the end of this document for the full design a second implementation
+would need.
 
 **Why UDS, not TCP, for this build.** The system is scoped to a single
 process on a single host. UDS removes the TCP/IP stack from the
@@ -103,188 +104,6 @@ unicast doesn't scale to many subscribers, and likely shared-memory ring
 buffers for the internal gateway↔matcher hop. UDS is the right choice under
 *this* build's constraints, not a general claim about production
 architecture.
-
-### Kernel-bypass transport (DPDK)
-
-BENCH.md's "Docker reproduction" section already measured where the
-per-message cost actually goes: matching logic itself is roughly 1% of
-the budget, and the remaining ~99% is socket syscalls and OS thread
-scheduling across four wake-ups per round trip (client write → gateway
-read wakes → channel send to matching → channel send to the
-return-dispatcher → client read wakes). Busy-spinning the matching thread
-removes exactly one of those four; the other three are still blocking
-syscalls. DPDK is the identified fix for that specific, measured
-remainder, not a generic "this would be faster" — it removes the syscall
-path for the wake-ups it touches by replacing kernel-mediated sockets
-with direct, polling access to NIC descriptor rings from userspace.
-
-**`DpdkTransport` implements the existing `Transport` trait as a second
-`impl`, chosen at compile time** — exactly what the trait's existence
-already promises. `bind`/`accept` stay the same two methods,
-`Connection: Read + Write` stays the same bound, and every caller above
-the trait — the gateway's reader/writer threads, `wire`'s framer, the
-whole order-entry path — calls the same two methods it already calls
-against `UdsTransport`. Nothing above the trait boundary needs to know
-which implementation it's talking to.
-
-**`unsafe` is confined to that one module**, and the RX/TX sides of the
-DPDK C API it calls have different, asymmetric ownership shapes worth
-stating precisely rather than glossing as "the same kind of call twice":
-- **RX**: `rte_eth_rx_burst` returns a burst of mbufs the PMD (poll-mode
-  driver) already allocated from the pool configured at port/queue
-  setup — the application never allocates on receive, it receives
-  already-populated mbufs and is responsible for freeing each one back to
-  its pool once the frame is consumed.
-- **TX**: `rte_pktmbuf_alloc` obtains an mbuf, the application fills it,
-  and `rte_eth_tx_burst` submits it; ownership transfers to the PMD only
-  for the mbufs it actually accepts. `tx_burst` returns how many of the
-  burst it took — any remainder is still the caller's to free, not the
-  PMD's, since it was never enqueued.
-
-Both are FFI calls into a C library, exactly the boundary CLAUDE.md
-reserves `unsafe` for. `bind`/`accept`'s own signatures stay safe; the
-`unsafe` blocks live inside their bodies, each with a comment naming the
-specific invariant the call depends on (queue/port initialized, burst
-size within what the ring was configured for, etc.) that Rust itself
-cannot check.
-
-**The RAII mbuf wrapper is what justified `unsafe` actually looks like
-here** — not permission to call into C, but a type that re-establishes
-the ownership invariant Rust normally provides for free. A DPDK mbuf is
-memory from a pre-allocated, hugepage-backed pool that DPDK's C runtime
-manages directly — nothing about it is on Rust's own heap, and nothing
-frees it automatically. A thin wrapper (`struct Mbuf(*mut rte_mbuf)`)
-whose `Drop` calls `rte_pktmbuf_free` handles both sides of the asymmetry
-above on the same exit path: an RX mbuf frees when consumed, and a TX
-mbuf the PMD did *not* accept frees too, rather than leaking — exactly
-the case a hand-rolled free path is most likely to get wrong, since the
-un-enqueued remainder of a partially-accepted `tx_burst` is easy to miss
-by hand and automatic on a `Drop` impl that runs on every exit path,
-including an early return or a panic mid-batch. That single `Drop` impl
-is where manual C memory management and Rust ownership actually
-reconcile; every other line inside `DpdkTransport` gets to look like
-ordinary safe Rust built on top of it.
-
-**What does not change: `core`, `wire`, `risk`, and every line of
-matching logic. Zero lines.** That's the entire point of the `Transport`
-trait having existed since before there was a second implementation to
-put behind it — ingress was already a compile-time choice, not an
-architectural commitment, so swapping the transport is a new module and a
-build-time selection, not a rewrite reaching into the matching core.
-
-**Why this is described here rather than built.** DPDK requires, all at
-once: hugepage-backed memory for every mbuf pool, unconditionally, not
-optional tuning; binding the NIC out of the kernel's own driver onto
-`UIO`/`VFIO` so userspace can talk to it directly, which takes that NIC
-away from the normal network stack entirely; root or `CAP_NET_ADMIN` to
-perform that binding; and a DPDK-compatible NIC (or a supported virtual
-device) to bind in the first place. None of that coexists with
-`docker compose up --build` working from a clean clone with no host
-setup — a real `DpdkTransport` would need its own separate,
-hugepage-and-root-privileged deployment path, not a drop-in replacement
-inside the existing container.
-
-**Stage 9 is why a DPDK number produced on this machine would be
-evidence of nothing.** BENCH.md's "CPU pinning: pinned vs. unpinned"
-section measured a correctly implemented, kernel-enforced pin — real and
-enforced at the guest kernel level inside the Linux container — and still
-found no observable tail-latency benefit, because Docker Desktop's
-hypervisor schedules that guest vCPU onto physical Apple Silicon cores
-underneath the pin, one layer below what the pin controls. That's not a
-caveat about the pinning code; it's a demonstrated finding about this
-development machine: hardware-proximate optimizations can't be honestly
-evaluated on it, because the layer that would need to hold still —
-physical core, NIC, kernel-bypass path — is virtualized out from under
-whatever this build controls. A DPDK implementation run inside the same
-Docker Desktop VM would hit the same wall for the same reason: kernel
-bypass on a NIC that is itself a virtio device presented by a hypervisor
-isn't kernel bypass in the sense that produces DPDK's actual numbers.
-Describing the design honestly, rather than building it and reporting a
-number this environment can't back up, is the more truthful deliverable.
-
-### Hugepages and NUMA
-
-CPU pinning, hugepage placement, and NIC locality are three independent
-placement decisions, and they only pay off together, on the same NUMA
-node. Getting any one of them wrong doesn't just forfeit that decision's
-own benefit — it can make the system slower than doing nothing at all,
-because the optimization removes the scheduler's freedom to compensate.
-A thread pinned away from its data can no longer be migrated toward it;
-that's the thread through the rest of this section.
-
-**Hugepages** cover more address space per TLB entry, so a working set
-that used to need many page-table walks under sustained access needs far
-fewer. The structures in this design that would actually benefit are the
-ones matching sweeps and cancels touch repeatedly: the arena
-(`crate::arena::Arena`'s `slots: Vec<Option<Node>>`, contiguous storage
-every sweep walks node-by-node) and each account's
-`AccountEntry::slots: Vec<u32>`. The catch is that hugepages are reserved
-*per NUMA node* — a 1GB page reserved on node 1 backing an arena that a
-thread pinned to a core on node 0 reads means every access crosses the
-inter-socket interconnect. That trades TLB misses for remote-memory
-latency, usually a bad trade, and worse than never having reserved the
-hugepage at all.
-
-This is also why CPU pinning and memory placement are independent
-decisions, not one decision — the part people get wrong.
-`sched_setaffinity` constrains which cores a thread may run on; it says
-nothing about which node backs the pages that thread reads. Pinning
-without matching memory placement can turn into a NUMA regression rather
-than a win, precisely because the pinned thread has given up the
-scheduler's ability to migrate it toward its data if the two ever drift
-apart. What rescues this in the current code is Linux's first-touch
-policy: a page is allocated on the node of whichever CPU first writes it,
-and `gateway::matching::run_matching_thread` calls
-`pin_to_dedicated_core()` before `Engine::new()` — so the arena is
-first-touched by the already-pinned matching thread, and lands on the
-right node by construction. That's a real property of this code's
-ordering, not an accident, but it's also not a general guarantee: had
-`Book` been constructed on the main thread and moved into the matching
-thread afterward, the arena would sit wherever the main thread happened
-to be at construction time. Explicit binding (`mbind`/`set_mempolicy`, or
-`numactl --membind` at process launch) is what would make the placement
-deterministic rather than dependent on allocation order.
-
-The NIC completes the picture, and ties directly to the DPDK section
-above: a NIC is attached to a specific socket's PCIe root complex, so its
-DMA writes land in that socket's local memory. A DPDK mbuf pool should be
-allocated on the node local to the NIC, and the poll-mode driver's thread
-pinned to a core on that same node — DPDK's own tooling reports each
-device's NUMA node specifically because this is a first-order deployment
-decision, not a tuning nicety. NIC on node 0, mbuf pool on node 1,
-matching thread on node 0 means every received packet crosses the
-interconnect at least once before anything reads it — kernel bypass
-paying for none of what it promised. Real deployments pin cores, reserve
-hugepages, and select NICs as one co-located decision, not three
-independent ones. Sharding across sockets for multiple symbols (the
-evolution path the Microstructure section names) is this same
-requirement one level down: each shard's matching thread, its
-hugepage-backed arena, and its NIC or NIC queue all need to land on that
-shard's own node.
-
-**None of this is measured, and stage 9 is why, as demonstrated evidence
-rather than a caveat.** BENCH.md's "CPU pinning: pinned vs. unpinned"
-section measured a correctly implemented, kernel-enforced CPU pin and
-found no observable tail-latency benefit, because Docker Desktop's
-hypervisor schedules the guest vCPU onto physical cores one layer below
-what the pin controls. The same structural problem applies here, and is
-worse: hugepages need host-level `hugetlbfs` reservation, which conflicts
-with this project's documented clean-clone, no-host-setup startup; NUMA
-needs multi-socket bare metal to have any second node to place things on
-or apart from. This development machine is a single-socket Apple Silicon
-laptop running one virtualized Linux guest behind a virtio NIC — there is
-no second node to place anything wrong on, and nothing to co-locate in
-the first place.
-
-The deliverable spec treats a p99 figure with no stated methodology as a
-negative signal. A figure produced with methodology the environment
-can't actually support is worse than that — it looks like evidence while
-being noise, and it's harder to catch than an admittedly-missing number.
-A real measurement here would need bare-metal multi-socket Linux,
-`hugetlbfs` pages reserved per node, `isolcpus` reserving a genuinely
-fixed physical core, and a NIC whose NUMA node is known and matched to
-the pinned core and the hugepage reservation — naming that precisely is
-more useful than a fabricated delta.
 
 ---
 
@@ -946,10 +765,11 @@ A real low-latency deployment would both spin and pin every thread in the
 hot path, not just one. That isn't done here because dedicating
 four-plus cores to one symbol's gateway threads doesn't scale past a
 handful of symbols, and because the real fix for socket-syscall overhead
-is kernel-bypass ("Kernel-bypass transport (DPDK)" in the Architecture
-section above), not spinning more threads around the same syscalls. Full pin-and-spin plus kernel-bypass
-together is what a production low-latency venue would actually run; this
-build pins and spins the one thread where it matters most for the
+is kernel-bypass ("Kernel-bypass transport (DPDK)", later in this
+document), not spinning more threads around the same syscalls. Full
+pin-and-spin plus kernel-bypass together is what a production
+low-latency venue would actually run; this build pins and spins the one
+thread where it matters most for the
 specific requirement (SPEC §9's zero-or-near-zero-allocation, low-jitter
 hot path), not uniformly across all four.
 
@@ -1012,3 +832,189 @@ exists for exactly this reason — and multicast for market-data fan-out,
 since unicast to N remote subscribers doesn't scale the way local
 broadcast does. Neither is a redesign; both are the abstraction boundary
 already in place being used for what it was built for.
+
+---
+
+## Kernel-bypass transport (DPDK)
+
+BENCH.md's "Docker reproduction" section already measured where the
+per-message cost actually goes: matching logic itself is roughly 1% of
+the budget, and the remaining ~99% is socket syscalls and OS thread
+scheduling across four wake-ups per round trip (client write → gateway
+read wakes → channel send to matching → channel send to the
+return-dispatcher → client read wakes). Busy-spinning the matching thread
+removes exactly one of those four; the other three are still blocking
+syscalls. DPDK is the identified fix for that specific, measured
+remainder, not a generic "this would be faster" — it removes the syscall
+path for the wake-ups it touches by replacing kernel-mediated sockets
+with direct, polling access to NIC descriptor rings from userspace.
+
+**`DpdkTransport` implements the existing `Transport` trait as a second
+`impl`, chosen at compile time** — exactly what the trait's existence
+already promises. `bind`/`accept` stay the same two methods,
+`Connection: Read + Write` stays the same bound, and every caller above
+the trait — the gateway's reader/writer threads, `wire`'s framer, the
+whole order-entry path — calls the same two methods it already calls
+against `UdsTransport`. Nothing above the trait boundary needs to know
+which implementation it's talking to.
+
+**`unsafe` is confined to that one module**, and the RX/TX sides of the
+DPDK C API it calls have different, asymmetric ownership shapes worth
+stating precisely rather than glossing as "the same kind of call twice":
+- **RX**: `rte_eth_rx_burst` returns a burst of mbufs the PMD (poll-mode
+  driver) already allocated from the pool configured at port/queue
+  setup — the application never allocates on receive, it receives
+  already-populated mbufs and is responsible for freeing each one back to
+  its pool once the frame is consumed.
+- **TX**: `rte_pktmbuf_alloc` obtains an mbuf, the application fills it,
+  and `rte_eth_tx_burst` submits it; ownership transfers to the PMD only
+  for the mbufs it actually accepts. `tx_burst` returns how many of the
+  burst it took — any remainder is still the caller's to free, not the
+  PMD's, since it was never enqueued.
+
+Both are FFI calls into a C library, exactly the boundary CLAUDE.md
+reserves `unsafe` for. `bind`/`accept`'s own signatures stay safe; the
+`unsafe` blocks live inside their bodies, each with a comment naming the
+specific invariant the call depends on (queue/port initialized, burst
+size within what the ring was configured for, etc.) that Rust itself
+cannot check.
+
+**The RAII mbuf wrapper is what justified `unsafe` actually looks like
+here** — not permission to call into C, but a type that re-establishes
+the ownership invariant Rust normally provides for free. A DPDK mbuf is
+memory from a pre-allocated, hugepage-backed pool that DPDK's C runtime
+manages directly — nothing about it is on Rust's own heap, and nothing
+frees it automatically. A thin wrapper (`struct Mbuf(*mut rte_mbuf)`)
+whose `Drop` calls `rte_pktmbuf_free` handles both sides of the asymmetry
+above on the same exit path: an RX mbuf frees when consumed, and a TX
+mbuf the PMD did *not* accept frees too, rather than leaking — exactly
+the case a hand-rolled free path is most likely to get wrong, since the
+un-enqueued remainder of a partially-accepted `tx_burst` is easy to miss
+by hand and automatic on a `Drop` impl that runs on every exit path,
+including an early return or a panic mid-batch. That single `Drop` impl
+is where manual C memory management and Rust ownership actually
+reconcile; every other line inside `DpdkTransport` gets to look like
+ordinary safe Rust built on top of it.
+
+**What does not change: `core`, `wire`, `risk`, and every line of
+matching logic. Zero lines.** That's the entire point of the `Transport`
+trait having existed since before there was a second implementation to
+put behind it — ingress was already a compile-time choice, not an
+architectural commitment, so swapping the transport is a new module and a
+build-time selection, not a rewrite reaching into the matching core.
+
+**Why this is described here rather than built.** DPDK requires, all at
+once: hugepage-backed memory for every mbuf pool, unconditionally, not
+optional tuning; binding the NIC out of the kernel's own driver onto
+`UIO`/`VFIO` so userspace can talk to it directly, which takes that NIC
+away from the normal network stack entirely; root or `CAP_NET_ADMIN` to
+perform that binding; and a DPDK-compatible NIC (or a supported virtual
+device) to bind in the first place. None of that coexists with
+`docker compose up --build` working from a clean clone with no host
+setup — a real `DpdkTransport` would need its own separate,
+hugepage-and-root-privileged deployment path, not a drop-in replacement
+inside the existing container.
+
+**Stage 9 is why a DPDK number produced on this machine would be
+evidence of nothing.** BENCH.md's "CPU pinning: pinned vs. unpinned"
+section measured a correctly implemented, kernel-enforced pin — real and
+enforced at the guest kernel level inside the Linux container — and still
+found no observable tail-latency benefit, because Docker Desktop's
+hypervisor schedules that guest vCPU onto physical Apple Silicon cores
+underneath the pin, one layer below what the pin controls. That's not a
+caveat about the pinning code; it's a demonstrated finding about this
+development machine: hardware-proximate optimizations can't be honestly
+evaluated on it, because the layer that would need to hold still —
+physical core, NIC, kernel-bypass path — is virtualized out from under
+whatever this build controls. A DPDK implementation run inside the same
+Docker Desktop VM would hit the same wall for the same reason: kernel
+bypass on a NIC that is itself a virtio device presented by a hypervisor
+isn't kernel bypass in the sense that produces DPDK's actual numbers.
+Describing the design honestly, rather than building it and reporting a
+number this environment can't back up, is the more truthful deliverable.
+
+---
+
+## Hugepages and NUMA
+
+CPU pinning, hugepage placement, and NIC locality are three independent
+placement decisions, and they only pay off together, on the same NUMA
+node. Getting any one of them wrong doesn't just forfeit that decision's
+own benefit — it can make the system slower than doing nothing at all,
+because the optimization removes the scheduler's freedom to compensate.
+A thread pinned away from its data can no longer be migrated toward it;
+that's the thread through the rest of this section.
+
+**Hugepages** cover more address space per TLB entry, so a working set
+that used to need many page-table walks under sustained access needs far
+fewer. The structures in this design that would actually benefit are the
+ones matching sweeps and cancels touch repeatedly: the arena
+(`crate::arena::Arena`'s `slots: Vec<Option<Node>>`, contiguous storage
+every sweep walks node-by-node) and each account's
+`AccountEntry::slots: Vec<u32>`. The catch is that hugepages are reserved
+*per NUMA node* — a 1GB page reserved on node 1 backing an arena that a
+thread pinned to a core on node 0 reads means every access crosses the
+inter-socket interconnect. That trades TLB misses for remote-memory
+latency, usually a bad trade, and worse than never having reserved the
+hugepage at all.
+
+This is also why CPU pinning and memory placement are independent
+decisions, not one decision — the part people get wrong.
+`sched_setaffinity` constrains which cores a thread may run on; it says
+nothing about which node backs the pages that thread reads. Pinning
+without matching memory placement can turn into a NUMA regression rather
+than a win, precisely because the pinned thread has given up the
+scheduler's ability to migrate it toward its data if the two ever drift
+apart. What rescues this in the current code is Linux's first-touch
+policy: a page is allocated on the node of whichever CPU first writes it,
+and `gateway::matching::run_matching_thread` calls
+`pin_to_dedicated_core()` before `Engine::new()` — so the arena is
+first-touched by the already-pinned matching thread, and lands on the
+right node by construction. That's a real property of this code's
+ordering, not an accident, but it's also not a general guarantee: had
+`Book` been constructed on the main thread and moved into the matching
+thread afterward, the arena would sit wherever the main thread happened
+to be at construction time. Explicit binding (`mbind`/`set_mempolicy`, or
+`numactl --membind` at process launch) is what would make the placement
+deterministic rather than dependent on allocation order.
+
+The NIC completes the picture, and ties directly to the DPDK section
+above: a NIC is attached to a specific socket's PCIe root complex, so its
+DMA writes land in that socket's local memory. A DPDK mbuf pool should be
+allocated on the node local to the NIC, and the poll-mode driver's thread
+pinned to a core on that same node — DPDK's own tooling reports each
+device's NUMA node specifically because this is a first-order deployment
+decision, not a tuning nicety. NIC on node 0, mbuf pool on node 1,
+matching thread on node 0 means every received packet crosses the
+interconnect at least once before anything reads it — kernel bypass
+paying for none of what it promised. Real deployments pin cores, reserve
+hugepages, and select NICs as one co-located decision, not three
+independent ones. Sharding across sockets for multiple symbols (the
+evolution path the Microstructure section names) is this same
+requirement one level down: each shard's matching thread, its
+hugepage-backed arena, and its NIC or NIC queue all need to land on that
+shard's own node.
+
+**None of this is measured, and stage 9 is why, as demonstrated evidence
+rather than a caveat.** BENCH.md's "CPU pinning: pinned vs. unpinned"
+section measured a correctly implemented, kernel-enforced CPU pin and
+found no observable tail-latency benefit, because Docker Desktop's
+hypervisor schedules the guest vCPU onto physical cores one layer below
+what the pin controls. The same structural problem applies here, and is
+worse: hugepages need host-level `hugetlbfs` reservation, which conflicts
+with this project's documented clean-clone, no-host-setup startup; NUMA
+needs multi-socket bare metal to have any second node to place things on
+or apart from. This development machine is a single-socket Apple Silicon
+laptop running one virtualized Linux guest behind a virtio NIC — there is
+no second node to place anything wrong on, and nothing to co-locate in
+the first place.
+
+The deliverable spec treats a p99 figure with no stated methodology as a
+negative signal. A figure produced with methodology the environment
+can't actually support is worse than that — it looks like evidence while
+being noise, and it's harder to catch than an admittedly-missing number.
+A real measurement here would need bare-metal multi-socket Linux,
+`hugetlbfs` pages reserved per node, `isolcpus` reserving a genuinely
+fixed physical core, and a NIC whose NUMA node is known and matched to
+the pinned core and the hugepage reservation — naming that precisely is
+more useful than a fabricated delta.
