@@ -202,6 +202,90 @@ isn't kernel bypass in the sense that produces DPDK's actual numbers.
 Describing the design honestly, rather than building it and reporting a
 number this environment can't back up, is the more truthful deliverable.
 
+### Hugepages and NUMA
+
+CPU pinning, hugepage placement, and NIC locality are three independent
+placement decisions, and they only pay off together, on the same NUMA
+node. Getting any one of them wrong doesn't just forfeit that decision's
+own benefit — it can make the system slower than doing nothing at all,
+because the optimization removes the scheduler's freedom to compensate.
+A thread pinned away from its data can no longer be migrated toward it;
+that's the thread through the rest of this section.
+
+**Hugepages** cover more address space per TLB entry, so a working set
+that used to need many page-table walks under sustained access needs far
+fewer. The structures in this design that would actually benefit are the
+ones matching sweeps and cancels touch repeatedly: the arena
+(`crate::arena::Arena`'s `slots: Vec<Option<Node>>`, contiguous storage
+every sweep walks node-by-node) and each account's
+`AccountEntry::slots: Vec<u32>`. The catch is that hugepages are reserved
+*per NUMA node* — a 1GB page reserved on node 1 backing an arena that a
+thread pinned to a core on node 0 reads means every access crosses the
+inter-socket interconnect. That trades TLB misses for remote-memory
+latency, usually a bad trade, and worse than never having reserved the
+hugepage at all.
+
+This is also why CPU pinning and memory placement are independent
+decisions, not one decision — the part people get wrong.
+`sched_setaffinity` constrains which cores a thread may run on; it says
+nothing about which node backs the pages that thread reads. Pinning
+without matching memory placement can turn into a NUMA regression rather
+than a win, precisely because the pinned thread has given up the
+scheduler's ability to migrate it toward its data if the two ever drift
+apart. What rescues this in the current code is Linux's first-touch
+policy: a page is allocated on the node of whichever CPU first writes it,
+and `gateway::matching::run_matching_thread` calls
+`pin_to_dedicated_core()` before `Engine::new()` — so the arena is
+first-touched by the already-pinned matching thread, and lands on the
+right node by construction. That's a real property of this code's
+ordering, not an accident, but it's also not a general guarantee: had
+`Book` been constructed on the main thread and moved into the matching
+thread afterward, the arena would sit wherever the main thread happened
+to be at construction time. Explicit binding (`mbind`/`set_mempolicy`, or
+`numactl --membind` at process launch) is what would make the placement
+deterministic rather than dependent on allocation order.
+
+The NIC completes the picture, and ties directly to the DPDK section
+above: a NIC is attached to a specific socket's PCIe root complex, so its
+DMA writes land in that socket's local memory. A DPDK mbuf pool should be
+allocated on the node local to the NIC, and the poll-mode driver's thread
+pinned to a core on that same node — DPDK's own tooling reports each
+device's NUMA node specifically because this is a first-order deployment
+decision, not a tuning nicety. NIC on node 0, mbuf pool on node 1,
+matching thread on node 0 means every received packet crosses the
+interconnect at least once before anything reads it — kernel bypass
+paying for none of what it promised. Real deployments pin cores, reserve
+hugepages, and select NICs as one co-located decision, not three
+independent ones. Sharding across sockets for multiple symbols (the
+evolution path the Microstructure section names) is this same
+requirement one level down: each shard's matching thread, its
+hugepage-backed arena, and its NIC or NIC queue all need to land on that
+shard's own node.
+
+**None of this is measured, and stage 9 is why, as demonstrated evidence
+rather than a caveat.** BENCH.md's "CPU pinning: pinned vs. unpinned"
+section measured a correctly implemented, kernel-enforced CPU pin and
+found no observable tail-latency benefit, because Docker Desktop's
+hypervisor schedules the guest vCPU onto physical cores one layer below
+what the pin controls. The same structural problem applies here, and is
+worse: hugepages need host-level `hugetlbfs` reservation, which conflicts
+with this project's documented clean-clone, no-host-setup startup; NUMA
+needs multi-socket bare metal to have any second node to place things on
+or apart from. This development machine is a single-socket Apple Silicon
+laptop running one virtualized Linux guest behind a virtio NIC — there is
+no second node to place anything wrong on, and nothing to co-locate in
+the first place.
+
+The deliverable spec treats a p99 figure with no stated methodology as a
+negative signal. A figure produced with methodology the environment
+can't actually support is worse than that — it looks like evidence while
+being noise, and it's harder to catch than an admittedly-missing number.
+A real measurement here would need bare-metal multi-socket Linux,
+`hugetlbfs` pages reserved per node, `isolcpus` reserving a genuinely
+fixed physical core, and a NIC whose NUMA node is known and matched to
+the pinned core and the hugepage reservation — naming that precisely is
+more useful than a fabricated delta.
+
 ---
 
 ## Wire protocol
