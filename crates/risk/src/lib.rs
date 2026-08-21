@@ -19,7 +19,7 @@ use core::Book;
 use core::Engine;
 use core::error::RejectReason;
 use core::event::{Command, Event};
-use core::types::{AccountId, OrderId, OrderKind, Price, Side, Tif};
+use core::types::{AccountId, EngineSeq, OrderId, OrderKind, Price, Side, Tif};
 
 /// Runs one command through the exact risk-then-matching path live traffic
 /// uses: risk first, and only if risk permits, `Engine::apply` (SPEC §5).
@@ -27,17 +27,28 @@ use core::types::{AccountId, OrderId, OrderKind, Price, Side, Tif};
 /// `Engine`/`RiskState` rather than a parallel reimplementation, so a
 /// command rejected live is guaranteed to be rejected identically on
 /// replay -- not just "expected to," by construction.
+///
+/// `engine_seq` is incremented exactly once here, for every command,
+/// whether it is risk-rejected below or reaches `Engine::apply` --
+/// `EngineSeq` counts every command the *system* processes (SPEC §2), not
+/// only ones the engine actually applied. This is the one and only
+/// increment site: the live matching thread and `bin::replay_file` both
+/// call this same function, so they cannot drift from each other by
+/// convention -- there is no second call site left to forget.
 pub fn process_command(
     engine: &mut Engine,
     risk_state: &mut RiskState,
     cmd: Command,
-    emit: &mut dyn FnMut(Event),
+    engine_seq: &mut EngineSeq,
+    emit: &mut dyn FnMut(EngineSeq, Event),
 ) {
+    engine_seq.0 += 1;
+    let seq = *engine_seq;
     if let Some(rejected) = risk_state.pre_apply_check(&cmd, engine.book()) {
-        emit(rejected);
+        emit(seq, rejected);
         return;
     }
-    engine.apply(cmd, emit);
+    engine.apply(cmd, &mut |event| emit(seq, event));
 }
 
 /// Kill switch + per-account limits + price band, owned by the matching

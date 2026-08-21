@@ -24,8 +24,20 @@ use std::sync::{Arc, Mutex};
 
 use core::error::RejectReason;
 use core::event::{Command, Event};
-use core::types::{AccountId, OrderId, StreamSeq};
+use core::types::{AccountId, EngineSeq, OrderId, StreamSeq};
 use wire::Framer;
+
+/// Sentinel for a `Rejected` event that never became a `Command` at all
+/// -- a malformed frame or unknown tag, rejected by this connection's
+/// reader before `wire::decode_command` ever succeeds, so it never
+/// reaches `risk::process_command` and has no real `EngineSeq` to carry
+/// (SPEC §2). `EngineSeq` starts at `EngineSeq(1)` for the first command
+/// that actually enters the system (`risk::process_command` increments
+/// before it reads), so `0` is otherwise never produced and is safe to
+/// reserve as "rejected at the wire layer, before this ever became a
+/// command" -- clients tracking their own command flow can treat it as
+/// "did not consume a sequence number."
+const WIRE_LEVEL_REJECT_ENGINE_SEQ: EngineSeq = EngineSeq(0);
 
 use crate::conn::ConnId;
 use crate::transport::{Transport, UdsTransport};
@@ -46,8 +58,8 @@ const READ_BUF_LEN: usize = 4096;
 pub fn run_order_entry(
     transport: UdsTransport,
     command_tx: SyncSender<(ConnId, Command)>,
-    return_tx: SyncSender<(ConnId, Event)>,
-    return_rx: Receiver<(ConnId, Event)>,
+    return_tx: SyncSender<(ConnId, EngineSeq, Event)>,
+    return_rx: Receiver<(ConnId, EngineSeq, Event)>,
 ) {
     let writers: Arc<Mutex<HashMap<ConnId, UnixStream>>> = Arc::new(Mutex::new(HashMap::new()));
 
@@ -87,7 +99,7 @@ fn run_reader(
     conn_id: ConnId,
     mut stream: UnixStream,
     command_tx: SyncSender<(ConnId, Command)>,
-    return_tx: SyncSender<(ConnId, Event)>,
+    return_tx: SyncSender<(ConnId, EngineSeq, Event)>,
 ) {
     let mut framer = Framer::new();
     let mut read_buf = [0u8; READ_BUF_LEN];
@@ -105,14 +117,22 @@ fn run_reader(
                 let _ = command_tx.send((conn_id, cmd));
             }
             Err(reason) => {
-                let _ = return_tx.send((conn_id, malformed_reject(reason)));
+                let _ = return_tx.send((
+                    conn_id,
+                    WIRE_LEVEL_REJECT_ENGINE_SEQ,
+                    malformed_reject(reason),
+                ));
             }
         });
         if drain_result.is_err() {
             // An unrecognized tag desyncs framing -- there is no length to
             // skip past to find the next frame, so this connection's
             // stream is unrecoverable from here.
-            let _ = return_tx.send((conn_id, malformed_reject(RejectReason::UnknownMessageType)));
+            let _ = return_tx.send((
+                conn_id,
+                WIRE_LEVEL_REJECT_ENGINE_SEQ,
+                malformed_reject(RejectReason::UnknownMessageType),
+            ));
             break;
         }
     }
@@ -138,17 +158,17 @@ fn malformed_reject(reason: RejectReason) -> Event {
 /// client went away) drops that connection's entry; nothing tries to
 /// operate on a closed connection again after that.
 fn run_return_dispatcher(
-    return_rx: Receiver<(ConnId, Event)>,
+    return_rx: Receiver<(ConnId, EngineSeq, Event)>,
     writers: Arc<Mutex<HashMap<ConnId, UnixStream>>>,
 ) {
     let mut seqs: HashMap<ConnId, u64> = HashMap::new();
 
-    for (conn_id, event) in return_rx {
+    for (conn_id, engine_seq, event) in return_rx {
         let seq = seqs.entry(conn_id).or_insert(0);
         *seq += 1;
 
         let mut buf = [0u8; wire::MAX_MESSAGE_LEN];
-        let len = wire::encode_event(StreamSeq(*seq), &event, &mut buf);
+        let len = wire::encode_event(StreamSeq(*seq), Some(engine_seq), &event, &mut buf);
 
         let mut writers = writers.lock().expect("writers mutex poisoned");
         let wrote_ok = writers

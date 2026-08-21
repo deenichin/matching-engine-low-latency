@@ -44,6 +44,13 @@ fn main() {
         new_order(4, 1, Side::Buy, 100, 1, Tif::Gtc),
         // Disengaged again, showing recovery.
         Command::KillSwitch { engaged: false },
+        // Rests now that the switch is off, so the book isn't empty at
+        // snapshot time below.
+        new_order(4, 2, Side::Buy, 90, 2, Tif::Gtc),
+        // A snapshot of what's left resting (account 4's order above) --
+        // exercises SnapshotLevel/SnapshotAccount/SnapshotSummary in the
+        // shipped sample, not just the five execution-report types.
+        Command::Snapshot,
     ];
 
     let path = std::path::Path::new("recordings/sample.bin");

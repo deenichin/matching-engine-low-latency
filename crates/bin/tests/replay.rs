@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use core::error::RejectReason;
 use core::event::{Command, Event};
-use core::types::{AccountId, OrderId, OrderKind, Price, Qty, Side, Tif};
+use core::types::{AccountId, EngineSeq, OrderId, OrderKind, Price, Qty, Side, Tif};
 
 fn temp_recording_path() -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -95,6 +95,13 @@ fn a_risk_rejection_reproduces_identically_on_replay() {
             output.execution_reports,
             vec![(
                 core::types::StreamSeq(1),
+                // KillSwitch is command 1 (engine_seq 1, no event emitted --
+                // Engine::dispatch's KillSwitch arm is a no-op); this
+                // NewOrder is command 2, engine_seq 2, risk-rejected before
+                // ever reaching Engine::apply (SPEC §2 -- EngineSeq counts
+                // every command the system processes, not only ones the
+                // engine applied).
+                EngineSeq(2),
                 Event::Rejected {
                     account_id: AccountId(1),
                     order_id: OrderId(1),

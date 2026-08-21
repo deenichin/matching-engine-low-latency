@@ -12,7 +12,7 @@ document states methodology alongside every figure, not the figure alone.
 | OS | Darwin 25.5.0 (macOS), arm64 |
 | Rust | rustc 1.91.1, cargo 1.91.1 |
 | Build profile | `cargo bench` (criterion, `opt-level` release-equivalent); `cargo run -p bench --release` |
-| CPU pinning | **Not enabled.** Pinning is stage 8 (SPEC §10) and hasn't been built yet — every number below runs on whatever core the OS scheduler happens to place each thread on. Treat the HDR figures as an unpinned baseline, not the pinned target number. |
+| CPU pinning | **Not enabled.** Pinning is stage 9 (SPEC §10, Extension slice) and hasn't been built yet — every number below runs on whatever core the OS scheduler happens to place each thread on. Treat the HDR figures as an unpinned baseline, not the pinned target number. |
 
 Two independent measurement tools, deliberately different in shape:
 
@@ -27,6 +27,50 @@ Two independent measurement tools, deliberately different in shape:
   report back through the real gateway → matching thread →
   return-dispatcher pipeline. These two tools measure different things on
   purpose; neither number substitutes for the other.
+
+### Docker reproduction
+
+Both benchmark suites (and the full test suite) also run inside
+`docker compose run --rm dev ...` (`dev` targets the `Dockerfile`'s
+`builder` stage, pinned to rustc 1.91.1 to match the host exactly — see
+the README's "Running, benchmarking, replaying" section). All three
+commands confirmed clean: `./check.sh` (147 tests, exit 0),
+`cargo bench -p core` (all 8 benchmarks, times consistent with the host
+figures below), and the HDR harness (999,998/1,000,000 matched — the same
+small-percentage-unmatched category as the host run below, not
+investigated).
+
+One real behavioral difference, not a correctness issue: **sustained
+throughput came out nearly identical to the host (~28,442 msg/s vs.
+~28,505 msg/s), but p50 latency was roughly 60x lower (117.951 µs vs.
+7196.671 µs)**. Both environments bottleneck at essentially the same
+sustained rate, but the queueing behavior leading up to that bottleneck
+differs: a plausible explanation is a smaller effective socket send
+buffer inside Docker Desktop's Linux VM, causing the sender's `write_all`
+to throttle down toward the sustainable rate sooner rather than building
+up the multi-millisecond backlog seen on bare-metal macOS. This is a
+different execution environment producing a different latency profile at
+the same throughput ceiling, not a version, dependency, or correctness
+difference — flagged rather than smoothed over.
+
+The criterion figures above (~150-300ns for `submit_no_match` etc.)
+measure `Book::submit_gtc` called directly, in-process — no socket, no
+thread hop, no syscalls. The HDR harness's ~35µs-per-message throughput
+ceiling (1 / 28,500 msg/s) is a different measurement: a full round trip
+crosses four thread wake-ups (client write → gateway thread's read wakes
+→ channel send to the matching thread → channel send to the
+return-dispatcher thread → client's reader thread wakes), each
+individually costing more than the entire `Book` call it wraps. The
+matching logic itself is roughly 1% of the per-message budget; the other
+99% is socket syscalls and OS thread scheduling. Busy-spinning the
+matching thread (SPEC §4) removes exactly one of those four wake-ups, by
+design — the other three (gateway's read, the dispatcher's channel
+receive, the client's read) are still blocking waits. This is the
+architectural price of single-writer correctness enforced over real
+sockets, not a discrepancy between the two measurements. It's the same
+cost class DPDK/kernel-bypass (SPEC §10) is named as future work to
+attack, by removing socket syscalls from the path entirely rather than
+reducing wake-ups one at a time.
 
 ---
 

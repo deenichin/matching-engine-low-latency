@@ -15,7 +15,7 @@
 
 use core::Engine;
 use core::event::{Command, Event};
-use core::types::{AccountId, OrderId, OrderKind, Price, Qty, Side, Tif};
+use core::types::{AccountId, EngineSeq, OrderId, OrderKind, Price, Qty, Side, Tif};
 use proptest::prelude::*;
 use risk::{RiskConfig, RiskState};
 
@@ -160,17 +160,28 @@ fn op_to_command(op: Op) -> Command {
 const GUARANTEED_TRADE_PRICE: u64 = 500;
 
 /// Runs one full sequence through the exact function replay uses, against
-/// a fresh `Engine`/`RiskState` pair.
-fn run_all(commands: &[Command]) -> (Vec<Event>, Option<Price>) {
+/// a fresh `Engine`/`RiskState` pair. Also collects the `EngineSeq` each
+/// event was stamped with -- `engine_seq` is new replayed state (SPEC
+/// §2), so determinism must cover it too, not just the `Event` sequence.
+fn run_all(commands: &[Command]) -> (Vec<Event>, Vec<EngineSeq>, Option<Price>) {
     let mut engine = Engine::new();
     let mut risk_state = RiskState::new(RiskConfig::default());
+    let mut engine_seq = EngineSeq(0);
     let mut events = Vec::new();
+    let mut engine_seqs = Vec::new();
     for cmd in commands {
-        risk::process_command(&mut engine, &mut risk_state, cmd.clone(), &mut |e| {
-            events.push(e)
-        });
+        risk::process_command(
+            &mut engine,
+            &mut risk_state,
+            cmd.clone(),
+            &mut engine_seq,
+            &mut |seq, e| {
+                engine_seqs.push(seq);
+                events.push(e)
+            },
+        );
     }
-    (events, engine.book().last_trade())
+    (events, engine_seqs, engine.book().last_trade())
 }
 
 // Deliberately not the `proptest! { #[test] fn ... }` sugar, and not
@@ -258,10 +269,11 @@ fn full_command_sequence_replays_identically() {
 
                 commands.extend(suffix.into_iter().map(op_to_command));
 
-                let (events_a, last_trade_a) = run_all(&commands);
-                let (events_b, last_trade_b) = run_all(&commands);
+                let (events_a, engine_seqs_a, last_trade_a) = run_all(&commands);
+                let (events_b, engine_seqs_b, last_trade_b) = run_all(&commands);
 
                 assert_eq!(events_a, events_b);
+                assert_eq!(engine_seqs_a, engine_seqs_b);
                 assert_eq!(last_trade_a, last_trade_b);
                 Ok(())
             },

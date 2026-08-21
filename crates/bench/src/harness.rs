@@ -93,6 +93,12 @@ fn event_correlation_id(event: &Event) -> Option<(AccountId, OrderId)> {
             ..
         } => Some((account_id, order_id)),
         Event::Trade { .. } | Event::BookUpdate { .. } => None,
+        // The bench workload never issues Snapshot -- these can't appear
+        // in a real run, but the match stays exhaustive rather than
+        // silently swallowing a future workload change.
+        Event::SnapshotLevel { .. }
+        | Event::SnapshotAccount { .. }
+        | Event::SnapshotSummary { .. } => None,
     }
 }
 
@@ -158,7 +164,7 @@ pub fn run(stream: UnixStream, workload: &Workload, config: RunConfig) -> RunRep
                     Ok(n) => {
                         framer.feed(&read_buf[..n]);
                         let _ = framer.drain_frames(|frame| {
-                            let Ok((_seq, event)) = wire::decode_event(frame) else {
+                            let Ok((_seq, _engine_seq, event)) = wire::decode_event(frame) else {
                                 return;
                             };
                             workload.observe(&event);

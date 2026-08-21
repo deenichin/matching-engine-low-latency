@@ -46,17 +46,27 @@ Stated first, deliberately. Out of scope, not attempted:
   the same numeric id concurrently. Every lookup, index, and duplicate check is
   therefore keyed on `(AccountId, OrderId)`, never bare `OrderId` (§4).
 - `AccountId`: `u64`. Every order carries one. Not optional.
-- `EngineSeq`: `u64`, engine-assigned, strictly monotonic across every command
-  the engine applies. Used for internal ordering and the determinism
-  comparison in §7. Not a per-stream sequence number — see `StreamSeq` below.
+- `EngineSeq`: `u64`, strictly monotonic across every command the **system**
+  processes — including one rejected by risk before it ever reaches
+  `Engine::apply`, not only ones the engine actually applied. Tracked
+  externally (mirroring `StreamSeq` below), not a field on `Event` itself:
+  the counter is incremented exactly once per command, at the single call
+  site `risk::process_command` owns, so a risk-rejected command still gets a
+  consistent value and the live matching thread and replay (§7) cannot drift
+  from each other by construction. Used for internal ordering and the
+  determinism comparison in §7, and carried on the wire on the five
+  execution-report message types (§3) — not a per-stream sequence number,
+  see `StreamSeq` below for that.
 - `StreamSeq`: `u64`, one independent monotonic counter **per outbound
   stream** — one for execution reports, one for market data. Gap detection
   (§8) is only meaningful against a counter that increments exactly once per
   message actually delivered on that stream. A single counter shared across
   streams increments on every event regardless of which stream carries it, so
   a subscriber to one stream sees permanent phantom gaps for every event that
-  went out the other stream. Each outbound message carries its stream's
-  `StreamSeq`, not `EngineSeq`.
+  went out the other stream. Every outbound message carries its stream's
+  `StreamSeq`; execution reports additionally carry `EngineSeq` (§3) — the
+  two are independent counters that mean different things and are both on
+  the wire.
 - Symbol is hardcoded to one instrument. Tick size, lot size, and all risk
   defaults are named constants.
 
@@ -272,24 +282,57 @@ for touching `Command`.)*
 
 ### Outbound messages
 
-Seven wire message types, one tag per `core::Event` variant — `Accepted`,
-`Rejected`, `Filled`, `Cancelled`, `Replaced`, `Trade`, `BookUpdate` — not
-a single message with a discriminant `state` field. `core::Event` is
-already seven distinct variants (§4); giving each its own wire tag keeps
-wire's "no parallel type hierarchy" promise on the outbound side, the same
-as `Command` on the inbound side.
+Ten wire message types, one tag per `core::Event` variant — `Accepted`,
+`Rejected`, `Filled`, `Cancelled`, `Replaced`, `Trade`, `BookUpdate`,
+`SnapshotLevel`, `SnapshotAccount`, `SnapshotSummary` — not a single
+message with a discriminant `state` field distinguishing all ten. Giving
+each its own wire tag keeps wire's "no parallel type hierarchy" promise on
+the outbound side, the same as `Command` on the inbound side.
 
 **Execution reports** — `Accepted`, `Rejected`, `Filled`, `Cancelled`,
-`Replaced` — each carry `order_id`, `account_id`, and `stream_seq` (this
-stream's counter, per §2), plus their own variant-specific fields:
-`resting_qty` on `Accepted`; a `reason` code on `Rejected`; fill `price`,
-`qty`, and `resting_qty` on `Filled`; `new_qty` and `priority_retained` on
-`Replaced`.
+`Replaced` — each carry `order_id`, `account_id`, `stream_seq` (this
+stream's counter, per §2), and `engine_seq` (§2 — the command's
+system-wide sequence, not this stream's), plus their own variant-specific
+fields: `resting_qty` on `Accepted`; a `reason` code on `Rejected`; fill
+`price`, `qty`, `resting_qty`, and `state` on `Filled`; `new_qty` and
+`priority_retained` on `Replaced`.
+
+`Rejected`'s `engine_seq` carries the sentinel value `0` when the reject
+never became a `Command` at all — a malformed frame or unknown tag,
+rejected by the gateway before `decode_command` ever succeeds, so it never
+reaches `risk::process_command` and has no real `EngineSeq` to report.
+`EngineSeq` starts at `1` for the first command that actually enters the
+system, so `0` is otherwise never produced and unambiguously means
+"rejected at the wire layer, before this ever became a command."
+
+`Filled.state` is `PartiallyFilled` or `Filled`, computed from
+`resting_qty` at the moment of that fill (`0` → `Filled`, otherwise
+`PartiallyFilled`) — mirroring FIX's `ExecutionReport`/`OrdStatus` (tag 39)
+design, a status field on one execution message type, rather than adding a
+second, `PartiallyFilled` tag alongside `Filled` (closer to FIX's
+`ExecType`, tag 150). This protocol already collapsed `ExecType` into the
+tag itself; `state` recovers the `OrdStatus` distinction without reopening
+that collapse.
 
 **Market data** — `Trade`, `BookUpdate` — `Trade` prints on every
 execution; `BookUpdate` (top-of-book) prints on every book change. Both
 carry their own stream's `stream_seq` (§2, §8) so a subscriber can detect
-gaps.
+gaps. Neither carries `engine_seq`: market data is not tied to any single
+command the way an execution report is.
+
+**Snapshot response** — `SnapshotLevel`, `SnapshotAccount`,
+`SnapshotSummary` — the inspection dump `Command::Snapshot` produces
+(§4). One `SnapshotLevel` per currently-occupied price level (`side`,
+`price`, resting `qty`, `order_count`), then one `SnapshotAccount` per
+account with at least one resting order (`account_id`,
+`open_order_count`, gross `notional`), then a single `SnapshotSummary`
+trailer (best bid/ask, `last_trade`, and how many `SnapshotLevel`/
+`SnapshotAccount` messages preceded it). All three carry `stream_seq`
+(routed to the requesting connection, same as any other execution report)
+but not `engine_seq` — a snapshot is a point-in-time dump, not tied to
+any one command's position in the sequence. Using a snapshot as a replay
+seed (starting replay from mid-session state) is explicitly out of scope
+— this is the inspection half only (see Known limitations, README).
 
 ### Validation
 
@@ -342,6 +385,13 @@ owns the destination stream: the gateway thread stamps execution reports with
 its stream's counter as it writes them; the market data thread stamps `Trade`
 and `BookUpdate` with its own, independent counter as it writes them. Neither
 counter is touched by the matching thread.
+
+`EngineSeq` (§2) is assigned earlier and differently: `risk::process_command`
+increments it once per command, on the matching thread, before checking risk
+or calling `Engine::apply` — not stamped downstream at write time like
+`StreamSeq`. This is deliberately the one and only increment site so that
+replay (§7), which calls the same function, cannot drift from the live
+matching thread's sequence by convention.
 
 Routing an event back to a connection is not "reply to whoever sent the
 triggering command": a fill, an STP cancellation, or a `MassCancel` can

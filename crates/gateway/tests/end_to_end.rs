@@ -10,7 +10,9 @@ use std::sync::{Arc, Barrier, Mutex, mpsc};
 use std::time::Duration;
 
 use core::event::{Command, Event};
-use core::types::{AccountId, OrderId, OrderKind, Price, Qty, Side, StreamSeq, Tif};
+use core::types::{
+    AccountId, EngineSeq, FillState, OrderId, OrderKind, Price, Qty, Side, StreamSeq, Tif,
+};
 use gateway::{Transport, UdsTransport, run_matching_thread, run_order_entry};
 
 fn test_socket_path() -> PathBuf {
@@ -128,7 +130,7 @@ fn send_new_order_side(
 /// Reads exactly one frame's worth of bytes and decodes it -- the tag
 /// byte determines the rest of the length (SPEC §3), so this reads the
 /// tag first, then exactly as many more bytes as it implies.
-fn read_one_event(client: &mut UnixStream) -> (StreamSeq, Event) {
+fn read_one_event(client: &mut UnixStream) -> (StreamSeq, Option<EngineSeq>, Event) {
     let mut tag_buf = [0u8; 1];
     client
         .read_exact(&mut tag_buf)
@@ -148,9 +150,13 @@ fn order_sent_over_the_socket_produces_a_correct_execution_report() {
     let mut client = connect(&path);
 
     send_new_order(&mut client, 1, 1, 100, 5);
-    let (seq, event) = read_one_event(&mut client);
+    let (seq, engine_seq, event) = read_one_event(&mut client);
 
     assert_eq!(seq, StreamSeq(1));
+    // The first command this engine ever processes gets EngineSeq(1) --
+    // the counter starts at 0 and risk::process_command increments
+    // before it reads (SPEC §2).
+    assert_eq!(engine_seq, Some(EngineSeq(1)));
     assert_eq!(
         event,
         Event::Accepted {
@@ -172,8 +178,8 @@ fn a_second_connection_is_served_independently() {
     send_new_order(&mut client1, 1, 1, 100, 5);
     send_new_order(&mut client2, 2, 1, 90, 3);
 
-    let (seq1, event1) = read_one_event(&mut client1);
-    let (seq2, event2) = read_one_event(&mut client2);
+    let (seq1, _engine_seq, event1) = read_one_event(&mut client1);
+    let (seq2, _engine_seq, event2) = read_one_event(&mut client2);
 
     // Each connection's stream_seq starts at 1 independently -- execution
     // reports are a per-connection stream (SPEC §2, §3), not one counter
@@ -221,7 +227,7 @@ fn a_fill_produces_multiple_individually_delivered_events() {
         &mut buf,
     );
     maker.write_all(&buf[..len]).unwrap();
-    let (_seq, maker_accept) = read_one_event(&mut maker);
+    let (_seq, _engine_seq, maker_accept) = read_one_event(&mut maker);
     assert_eq!(
         maker_accept,
         Event::Accepted {
@@ -235,8 +241,8 @@ fn a_fill_produces_multiple_individually_delivered_events() {
 
     // Taker sees its own Filled, then its own Accepted -- two separate
     // frames, not one message batching both.
-    let (taker_seq_1, taker_filled) = read_one_event(&mut taker);
-    let (taker_seq_2, taker_accept) = read_one_event(&mut taker);
+    let (taker_seq_1, _engine_seq, taker_filled) = read_one_event(&mut taker);
+    let (taker_seq_2, _engine_seq, taker_accept) = read_one_event(&mut taker);
     assert_eq!(taker_seq_1, StreamSeq(1));
     assert_eq!(taker_seq_2, StreamSeq(2));
     assert_eq!(
@@ -248,6 +254,7 @@ fn a_fill_produces_multiple_individually_delivered_events() {
             price: Price(100),
             qty: Qty(5),
             resting_qty: Qty(0),
+            state: FillState::Filled,
         }
     );
     assert_eq!(
@@ -261,7 +268,7 @@ fn a_fill_produces_multiple_individually_delivered_events() {
 
     // Maker, on its own connection, sees its own Filled as a second,
     // independently sequenced frame.
-    let (maker_seq_2, maker_filled) = read_one_event(&mut maker);
+    let (maker_seq_2, _engine_seq, maker_filled) = read_one_event(&mut maker);
     assert_eq!(maker_seq_2, StreamSeq(2));
     assert_eq!(
         maker_filled,
@@ -272,6 +279,7 @@ fn a_fill_produces_multiple_individually_delivered_events() {
             price: Price(100),
             qty: Qty(5),
             resting_qty: Qty(0),
+            state: FillState::Filled,
         }
     );
 }
@@ -300,7 +308,7 @@ fn malformed_input_is_rejected_without_reaching_the_matching_thread() {
     buf[26..34].copy_from_slice(&0u64.to_le_bytes()); // qty offset -> 0
     client.write_all(&buf[..len]).unwrap();
 
-    let (_seq, event) = read_one_event(&mut client);
+    let (_seq, engine_seq, event) = read_one_event(&mut client);
     assert_eq!(
         event,
         Event::Rejected {
@@ -309,11 +317,18 @@ fn malformed_input_is_rejected_without_reaching_the_matching_thread() {
             reason: core::error::RejectReason::ZeroQuantity,
         }
     );
+    // This never became a Command -- decode_command rejected it before
+    // risk::process_command ever saw it -- so it carries the EngineSeq(0)
+    // sentinel, not a real value (SPEC §2).
+    assert_eq!(engine_seq, Some(EngineSeq(0)));
 
     // The connection is still alive and normal orders still work --
     // rejecting one malformed frame didn't take down the reader.
     send_new_order(&mut client, 1, 1, 100, 5);
-    let (_seq, event) = read_one_event(&mut client);
+    let (_seq, engine_seq, event) = read_one_event(&mut client);
+    // The wire-level reject above did not consume a real EngineSeq value
+    // -- the first genuine command still gets EngineSeq(1), not 2.
+    assert_eq!(engine_seq, Some(EngineSeq(1)));
     assert_eq!(
         event,
         Event::Accepted {
@@ -358,7 +373,7 @@ fn concurrent_submissions_are_matched_in_strict_arrival_order() {
                 }
                 let qty = i as u64 + 1;
                 send_new_order_side(&mut conn, 100 + i as u64, 1, Side::Sell, 100, qty);
-                let (_seq, event) = read_one_event(&mut conn);
+                let (_seq, _engine_seq, event) = read_one_event(&mut conn);
                 assert!(
                     matches!(event, Event::Accepted { resting_qty, .. } if resting_qty.0 == qty)
                 );
@@ -381,13 +396,13 @@ fn concurrent_submissions_are_matched_in_strict_arrival_order() {
 
     let mut fill_qtys = Vec::with_capacity(N);
     for _ in 0..N {
-        let (_seq, event) = read_one_event(&mut taker);
+        let (_seq, _engine_seq, event) = read_one_event(&mut taker);
         match event {
             Event::Filled { qty, .. } => fill_qtys.push(qty.0),
             other => panic!("expected a Filled event, got {other:?}"),
         }
     }
-    let (_seq, event) = read_one_event(&mut taker);
+    let (_seq, _engine_seq, event) = read_one_event(&mut taker);
     assert!(matches!(event, Event::Accepted { resting_qty, .. } if resting_qty.0 == 0));
 
     let expected: Vec<u64> = (1..=N as u64).collect();
@@ -444,7 +459,7 @@ fn concurrent_submissions_with_no_ordering_gate_preserve_book_invariants() {
                 let mut filled = 0u64;
                 let mut resting = 1u64;
                 while resting > 0 {
-                    let (_seq, event) = read_one_event(&mut conn);
+                    let (_seq, _engine_seq, event) = read_one_event(&mut conn);
                     match event {
                         Event::Accepted { resting_qty, .. } => resting = resting_qty.0,
                         Event::Filled { qty, resting_qty, .. } => {

@@ -113,7 +113,7 @@ fn run_subscriber_writer(
         seq += 1 + dropped;
 
         let mut buf = [0u8; wire::MAX_MESSAGE_LEN];
-        let len = wire::encode_event(StreamSeq(seq), &event, &mut buf);
+        let len = wire::encode_event(StreamSeq(seq), None, &event, &mut buf);
         if stream.write_all(&buf[..len]).is_err() {
             subscribers
                 .lock()

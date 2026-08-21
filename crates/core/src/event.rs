@@ -5,7 +5,7 @@
 //! is built in stage 1; this module only defines the shapes.
 
 use crate::error::RejectReason;
-use crate::types::{AccountId, OrderId, OrderKind, Price, Qty, Side, Tif};
+use crate::types::{AccountId, FillState, OrderId, OrderKind, Price, Qty, Side, Tif};
 
 /// A decoded, gateway-validated instruction for the engine to apply.
 ///
@@ -79,6 +79,10 @@ pub enum Event {
         qty: Qty,
         /// Quantity still resting on this order after this fill.
         resting_qty: Qty,
+        /// Order-status distinction derived from `resting_qty` at the
+        /// moment of this fill (FIX `OrdStatus`-mirroring — see
+        /// [`FillState`]'s own docs).
+        state: FillState,
     },
     Cancelled {
         account_id: AccountId,
@@ -102,5 +106,35 @@ pub enum Event {
     BookUpdate {
         best_bid: Option<(Price, Qty)>,
         best_ask: Option<(Price, Qty)>,
+    },
+    /// One resting price level, in response to `Command::Snapshot`
+    /// (SPEC §3). One of these per currently-occupied level, in
+    /// `Book::snapshot`'s traversal order.
+    SnapshotLevel {
+        side: Side,
+        price: Price,
+        qty: Qty,
+        order_count: u64,
+    },
+    /// One account with at least one resting order, in response to
+    /// `Command::Snapshot`. One of these per account discovered during the
+    /// same traversal, each read once from its already-maintained
+    /// `AccountEntry` rather than re-derived.
+    SnapshotAccount {
+        account_id: AccountId,
+        open_order_count: u64,
+        notional: u128,
+    },
+    /// Trailer closing out a `Command::Snapshot` response: top-of-book,
+    /// last trade, and how many `SnapshotLevel`/`SnapshotAccount` events
+    /// preceded it — sent last, once both counts are already known from
+    /// the traversal that produced them, rather than requiring a second
+    /// pass to count them upfront.
+    SnapshotSummary {
+        best_bid: Option<(Price, Qty)>,
+        best_ask: Option<(Price, Qty)>,
+        last_trade: Option<Price>,
+        level_count: u64,
+        account_count: u64,
     },
 }

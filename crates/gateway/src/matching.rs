@@ -29,7 +29,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 
-use core::types::{AccountId, MAX_OPEN_ORDERS, OrderId};
+use core::types::{AccountId, EngineSeq, MAX_OPEN_ORDERS, OrderId};
 use core::{Command, Engine, Event};
 
 use crate::conn::ConnId;
@@ -104,6 +104,13 @@ fn event_id(event: &Event) -> Option<(AccountId, OrderId)> {
             ..
         } => Some((*account_id, *order_id)),
         Event::Trade { .. } | Event::BookUpdate { .. } => None,
+        // Snapshot responses are routed directly to the requesting
+        // connection before this function is ever consulted (see
+        // `run_matching_thread`'s dedicated routing arm) -- they carry
+        // no single (account, order) identity to route by anyway.
+        Event::SnapshotLevel { .. }
+        | Event::SnapshotAccount { .. }
+        | Event::SnapshotSummary { .. } => None,
     }
 }
 
@@ -132,7 +139,7 @@ fn event_id(event: &Event) -> Option<(AccountId, OrderId)> {
 /// when recording is off (the default).
 pub fn run_matching_thread(
     command_rx: Receiver<(ConnId, Command)>,
-    return_tx: SyncSender<(ConnId, Event)>,
+    return_tx: SyncSender<(ConnId, EngineSeq, Event)>,
     market_data_tx: SyncSender<Event>,
     mut risk_state: risk::RiskState,
     mut recorder: Option<BufWriter<File>>,
@@ -140,6 +147,11 @@ pub fn run_matching_thread(
     let mut engine = Engine::new();
     let mut resting_conn: HashMap<(AccountId, OrderId), ConnId> =
         HashMap::with_capacity(RESTING_CONN_INITIAL_CAPACITY);
+    // Every command this thread ever processes gets exactly one
+    // `EngineSeq`, assigned inside `risk::process_command` itself (the
+    // one increment site, SPEC §2) -- this counter lives for the
+    // thread's whole lifetime, mirroring how `resting_conn` does.
+    let mut engine_seq = EngineSeq(0);
 
     loop {
         let (conn_id, cmd) = match command_rx.try_recv() {
@@ -163,64 +175,88 @@ pub fn run_matching_thread(
 
         let self_id = command_self_id(&cmd);
 
-        risk::process_command(&mut engine, &mut risk_state, cmd, &mut |event| {
-            if matches!(event, Event::Trade { .. } | Event::BookUpdate { .. }) {
-                let _ = market_data_tx.try_send(event);
-                return;
-            }
+        risk::process_command(
+            &mut engine,
+            &mut risk_state,
+            cmd,
+            &mut engine_seq,
+            &mut |seq, event| {
+                if matches!(event, Event::Trade { .. } | Event::BookUpdate { .. }) {
+                    let _ = market_data_tx.try_send(event);
+                    return;
+                }
 
-            // Always Some here -- every non-market-data Event variant
-            // carries an account/order (checked above).
-            let id = event_id(&event).expect("execution-report events always carry account/order");
-            let route = if Some(id) == self_id {
-                conn_id
-            } else {
-                // A counterparty touched incidentally by this command --
-                // STP, or a fill/mass-cancel against an order that rested
-                // from a different connection. Falling back to conn_id
-                // would silently misroute to the wrong client if the
-                // table is ever missing an entry it shouldn't be.
-                *resting_conn.get(&id).unwrap_or(&conn_id)
-            };
+                // A snapshot's response always belongs to whoever asked for
+                // it, never a counterparty -- unlike fills/STP/mass-cancel,
+                // which can legitimately target a different connection's
+                // resting order. Routed directly, bypassing `resting_conn`
+                // entirely, and carrying no `EngineSeq` on the wire (SPEC
+                // §2: `Snapshot*` events are a point-in-time dump, not tied
+                // to any one command).
+                if matches!(
+                    event,
+                    Event::SnapshotLevel { .. }
+                        | Event::SnapshotAccount { .. }
+                        | Event::SnapshotSummary { .. }
+                ) {
+                    let _ = return_tx.send((conn_id, seq, event));
+                    return;
+                }
 
-            match &event {
-                Event::Accepted { resting_qty, .. } | Event::Filled { resting_qty, .. }
-                    if resting_qty.0 > 0 =>
-                {
-                    resting_conn.insert(id, route);
-                }
-                Event::Filled { resting_qty, .. } if resting_qty.0 == 0 => {
-                    resting_conn.remove(&id);
-                }
-                Event::Cancelled { .. } => {
-                    resting_conn.remove(&id);
-                }
-                Event::Replaced { .. } => {
-                    // Still resting somewhere after the amend (a modify
-                    // that empties out ends in Filled{resting_qty: 0}
-                    // instead, handled above) -- refresh the association
-                    // in case this modify came from a different
-                    // connection than the original submit (SPEC §4: an
-                    // account may hold more than one open connection).
-                    resting_conn.insert(id, route);
-                }
-                _ => {}
-            }
+                // Always Some here -- every non-market-data, non-snapshot
+                // Event variant carries an account/order (checked above).
+                let id =
+                    event_id(&event).expect("execution-report events always carry account/order");
+                let route = if Some(id) == self_id {
+                    conn_id
+                } else {
+                    // A counterparty touched incidentally by this command --
+                    // STP, or a fill/mass-cancel against an order that rested
+                    // from a different connection. Falling back to conn_id
+                    // would silently misroute to the wrong client if the
+                    // table is ever missing an entry it shouldn't be.
+                    *resting_conn.get(&id).unwrap_or(&conn_id)
+                };
 
-            let _ = return_tx.send((route, event));
-        });
+                match &event {
+                    Event::Accepted { resting_qty, .. } | Event::Filled { resting_qty, .. }
+                        if resting_qty.0 > 0 =>
+                    {
+                        resting_conn.insert(id, route);
+                    }
+                    Event::Filled { resting_qty, .. } if resting_qty.0 == 0 => {
+                        resting_conn.remove(&id);
+                    }
+                    Event::Cancelled { .. } => {
+                        resting_conn.remove(&id);
+                    }
+                    Event::Replaced { .. } => {
+                        // Still resting somewhere after the amend (a modify
+                        // that empties out ends in Filled{resting_qty: 0}
+                        // instead, handled above) -- refresh the association
+                        // in case this modify came from a different
+                        // connection than the original submit (SPEC §4: an
+                        // account may hold more than one open connection).
+                        resting_conn.insert(id, route);
+                    }
+                    _ => {}
+                }
+
+                let _ = return_tx.send((route, seq, event));
+            },
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::types::{OrderKind, Price, Qty, Side, Tif};
+    use core::types::{FillState, OrderKind, Price, Qty, Side, Tif};
     use std::sync::mpsc;
     use std::time::Duration;
 
     type CommandSender = mpsc::SyncSender<(ConnId, Command)>;
-    type ReturnReceiver = mpsc::Receiver<(ConnId, Event)>;
+    type ReturnReceiver = mpsc::Receiver<(ConnId, EngineSeq, Event)>;
 
     fn spawn() -> (CommandSender, ReturnReceiver) {
         let (command_tx, command_rx) = mpsc::sync_channel(16);
@@ -233,7 +269,7 @@ mod tests {
         (command_tx, return_rx)
     }
 
-    fn recv(return_rx: &mpsc::Receiver<(ConnId, Event)>) -> (ConnId, Event) {
+    fn recv(return_rx: &mpsc::Receiver<(ConnId, EngineSeq, Event)>) -> (ConnId, EngineSeq, Event) {
         return_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("matching thread did not respond in time")
@@ -261,7 +297,7 @@ mod tests {
         command_tx
             .send((maker_conn, new_order(1, 1, Side::Sell, 100, 5)))
             .unwrap();
-        let (conn, event) = recv(&return_rx);
+        let (conn, _seq, event) = recv(&return_rx);
         assert_eq!(conn, maker_conn);
         assert_eq!(
             event,
@@ -276,9 +312,9 @@ mod tests {
             .send((taker_conn, new_order(2, 1, Side::Buy, 100, 5)))
             .unwrap();
 
-        let (conn_a, event_a) = recv(&return_rx);
-        let (conn_b, event_b) = recv(&return_rx);
-        let (conn_c, event_c) = recv(&return_rx);
+        let (conn_a, _seq_a, event_a) = recv(&return_rx);
+        let (conn_b, _seq_b, event_b) = recv(&return_rx);
+        let (conn_c, _seq_c, event_c) = recv(&return_rx);
 
         // Taker's own Filled and Accepted route to the taker's connection;
         // the maker's Filled -- for a completely different account --
@@ -293,6 +329,7 @@ mod tests {
                 price: Price(100),
                 qty: Qty(5),
                 resting_qty: Qty(0),
+                state: FillState::Filled,
             }
         );
         assert_eq!(conn_b, maker_conn);
@@ -305,6 +342,7 @@ mod tests {
                 price: Price(100),
                 qty: Qty(5),
                 resting_qty: Qty(0),
+                state: FillState::Filled,
             }
         );
         assert_eq!(conn_c, taker_conn);
@@ -329,7 +367,7 @@ mod tests {
         command_tx
             .send((resting_conn_id, new_order(1, 1, Side::Sell, 100, 5)))
             .unwrap();
-        let (conn, _accepted) = recv(&return_rx);
+        let (conn, _seq, _accepted) = recv(&return_rx);
         assert_eq!(conn, resting_conn_id);
 
         // Same account crosses its own resting order from a different
@@ -338,8 +376,8 @@ mod tests {
             .send((aggressor_conn_id, new_order(1, 2, Side::Buy, 100, 3)))
             .unwrap();
 
-        let (conn_a, event_a) = recv(&return_rx);
-        let (conn_b, event_b) = recv(&return_rx);
+        let (conn_a, _seq_a, event_a) = recv(&return_rx);
+        let (conn_b, _seq_b, event_b) = recv(&return_rx);
 
         assert_eq!(
             conn_a, resting_conn_id,
@@ -390,8 +428,8 @@ mod tests {
             ))
             .unwrap();
 
-        let (first_conn, first_event) = recv(&return_rx);
-        let (second_conn, second_event) = recv(&return_rx);
+        let (first_conn, _first_seq, first_event) = recv(&return_rx);
+        let (second_conn, _second_seq, second_event) = recv(&return_rx);
 
         let mut by_order: HashMap<OrderId, ConnId> = HashMap::new();
         for (conn, event) in [(first_conn, first_event), (second_conn, second_event)] {

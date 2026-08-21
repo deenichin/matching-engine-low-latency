@@ -3,7 +3,7 @@
 //! allocates.
 
 use core::error::RejectReason;
-use core::types::{OrderKind, Side, Tif};
+use core::types::{FillState, OrderKind, Side, Tif};
 
 pub(crate) fn write_u8(buf: &mut [u8], offset: usize, value: u8) {
     buf[offset] = value;
@@ -21,6 +21,19 @@ pub(crate) fn read_u64(buf: &[u8], offset: usize) -> u64 {
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&buf[offset..offset + 8]);
     u64::from_le_bytes(bytes)
+}
+
+/// `SnapshotAccount`'s `notional` is a `u128` (SPEC §5's gross-notional
+/// running total) -- 16 raw little-endian bytes, not two u64 halves,
+/// since `u128::to_le_bytes`/`from_le_bytes` already give exactly that.
+pub(crate) fn write_u128(buf: &mut [u8], offset: usize, value: u128) {
+    buf[offset..offset + 16].copy_from_slice(&value.to_le_bytes());
+}
+
+pub(crate) fn read_u128(buf: &[u8], offset: usize) -> u128 {
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&buf[offset..offset + 16]);
+    u128::from_le_bytes(bytes)
 }
 
 pub(crate) fn write_bool(buf: &mut [u8], offset: usize, value: bool) {
@@ -80,6 +93,21 @@ pub(crate) fn tif_from_u8(value: u8) -> Result<Tif, RejectReason> {
         1 => Ok(Tif::Ioc),
         2 => Ok(Tif::Fok),
         3 => Ok(Tif::PostOnly),
+        _ => Err(RejectReason::MalformedMessage),
+    }
+}
+
+pub(crate) fn fill_state_to_u8(state: FillState) -> u8 {
+    match state {
+        FillState::PartiallyFilled => 0,
+        FillState::Filled => 1,
+    }
+}
+
+pub(crate) fn fill_state_from_u8(value: u8) -> Result<FillState, RejectReason> {
+    match value {
+        0 => Ok(FillState::PartiallyFilled),
+        1 => Ok(FillState::Filled),
         _ => Err(RejectReason::MalformedMessage),
     }
 }

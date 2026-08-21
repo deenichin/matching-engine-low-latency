@@ -29,7 +29,7 @@
 
 use core::Engine;
 use core::event::{Command, Event};
-use core::types::{AccountId, OrderId, OrderKind, Price, Qty, Side, Tif};
+use core::types::{AccountId, EngineSeq, OrderId, OrderKind, Price, Qty, Side, Tif};
 use risk::{RiskConfig, RiskState};
 use std::collections::VecDeque;
 
@@ -37,7 +37,7 @@ use std::collections::VecDeque;
 // (SPEC §9: "its unsafe impl GlobalAlloc lives in the dependency, not in
 // this source") -- declaring one here too would conflict with it.
 
-fn discard(_: Event) {}
+fn discard(_: EngineSeq, _: Event) {}
 
 fn new_order(
     account: u64,
@@ -60,8 +60,13 @@ fn new_order(
     }
 }
 
-fn apply(engine: &mut Engine, risk_state: &mut RiskState, cmd: Command) {
-    risk::process_command(engine, risk_state, cmd, &mut discard);
+fn apply(
+    engine: &mut Engine,
+    risk_state: &mut RiskState,
+    engine_seq: &mut EngineSeq,
+    cmd: Command,
+) {
+    risk::process_command(engine, risk_state, cmd, engine_seq, &mut discard);
 }
 
 // -- hot_path_allocates_nothing ------------------------------------------
@@ -82,11 +87,17 @@ fn apply(engine: &mut Engine, risk_state: &mut RiskState, cmd: Command) {
 ///
 /// `order_id_base` lets this run twice against the same accounts without
 /// a `DuplicateOrderId` reject the second time.
-fn run_sequence(engine: &mut Engine, risk_state: &mut RiskState, order_id_base: u64) {
+fn run_sequence(
+    engine: &mut Engine,
+    risk_state: &mut RiskState,
+    engine_seq: &mut EngineSeq,
+    order_id_base: u64,
+) {
     // Fresh targets for this pass.
     apply(
         engine,
         risk_state,
+        engine_seq,
         new_order(
             7,
             order_id_base,
@@ -100,6 +111,7 @@ fn run_sequence(engine: &mut Engine, risk_state: &mut RiskState, order_id_base: 
     apply(
         engine,
         risk_state,
+        engine_seq,
         new_order(
             8,
             order_id_base,
@@ -113,6 +125,7 @@ fn run_sequence(engine: &mut Engine, risk_state: &mut RiskState, order_id_base: 
     apply(
         engine,
         risk_state,
+        engine_seq,
         new_order(
             9,
             order_id_base,
@@ -126,6 +139,7 @@ fn run_sequence(engine: &mut Engine, risk_state: &mut RiskState, order_id_base: 
     apply(
         engine,
         risk_state,
+        engine_seq,
         new_order(
             10,
             order_id_base,
@@ -139,6 +153,7 @@ fn run_sequence(engine: &mut Engine, risk_state: &mut RiskState, order_id_base: 
     apply(
         engine,
         risk_state,
+        engine_seq,
         new_order(
             11,
             order_id_base,
@@ -152,6 +167,7 @@ fn run_sequence(engine: &mut Engine, risk_state: &mut RiskState, order_id_base: 
     apply(
         engine,
         risk_state,
+        engine_seq,
         new_order(
             11,
             order_id_base + 1,
@@ -168,6 +184,7 @@ fn run_sequence(engine: &mut Engine, risk_state: &mut RiskState, order_id_base: 
     apply(
         engine,
         risk_state,
+        engine_seq,
         new_order(
             3,
             order_id_base,
@@ -184,6 +201,7 @@ fn run_sequence(engine: &mut Engine, risk_state: &mut RiskState, order_id_base: 
     apply(
         engine,
         risk_state,
+        engine_seq,
         new_order(
             4,
             order_id_base,
@@ -199,6 +217,7 @@ fn run_sequence(engine: &mut Engine, risk_state: &mut RiskState, order_id_base: 
     apply(
         engine,
         risk_state,
+        engine_seq,
         new_order(
             5,
             order_id_base,
@@ -214,6 +233,7 @@ fn run_sequence(engine: &mut Engine, risk_state: &mut RiskState, order_id_base: 
     apply(
         engine,
         risk_state,
+        engine_seq,
         new_order(
             6,
             order_id_base,
@@ -229,6 +249,7 @@ fn run_sequence(engine: &mut Engine, risk_state: &mut RiskState, order_id_base: 
     apply(
         engine,
         risk_state,
+        engine_seq,
         new_order(
             3,
             order_id_base + 1,
@@ -245,6 +266,7 @@ fn run_sequence(engine: &mut Engine, risk_state: &mut RiskState, order_id_base: 
     apply(
         engine,
         risk_state,
+        engine_seq,
         new_order(
             7,
             order_id_base + 1,
@@ -260,6 +282,7 @@ fn run_sequence(engine: &mut Engine, risk_state: &mut RiskState, order_id_base: 
     apply(
         engine,
         risk_state,
+        engine_seq,
         Command::CancelOrder {
             account_id: AccountId(8),
             order_id: OrderId(order_id_base),
@@ -270,6 +293,7 @@ fn run_sequence(engine: &mut Engine, risk_state: &mut RiskState, order_id_base: 
     apply(
         engine,
         risk_state,
+        engine_seq,
         Command::CancelReplace {
             account_id: AccountId(9),
             order_id: OrderId(order_id_base),
@@ -283,6 +307,7 @@ fn run_sequence(engine: &mut Engine, risk_state: &mut RiskState, order_id_base: 
     apply(
         engine,
         risk_state,
+        engine_seq,
         Command::CancelReplace {
             account_id: AccountId(10),
             order_id: OrderId(order_id_base),
@@ -295,24 +320,28 @@ fn run_sequence(engine: &mut Engine, risk_state: &mut RiskState, order_id_base: 
     apply(
         engine,
         risk_state,
+        engine_seq,
         Command::MassCancel {
             account_id: AccountId(11),
         },
     );
 }
 
-fn setup() -> (Engine, RiskState) {
+fn setup() -> (Engine, RiskState, EngineSeq) {
     let mut engine = Engine::new();
     let mut risk_state = RiskState::new(RiskConfig::default());
+    let mut engine_seq = EngineSeq(0);
 
     apply(
         &mut engine,
         &mut risk_state,
+        &mut engine_seq,
         new_order(1, 1, Side::Sell, 100, 500, OrderKind::Limit, Tif::Gtc),
     );
     apply(
         &mut engine,
         &mut risk_state,
+        &mut engine_seq,
         new_order(2, 1, Side::Buy, 90, 500, OrderKind::Limit, Tif::Gtc),
     );
 
@@ -321,17 +350,22 @@ fn setup() -> (Engine, RiskState) {
     // `mass_cancel_scratch`, each `AccountEntry::slots`, the B-tree nodes
     // for 80/90/95/100) the measured run below will touch, so the
     // measured run pays none of their first-touch costs.
-    run_sequence(&mut engine, &mut risk_state, 1_000);
+    run_sequence(&mut engine, &mut risk_state, &mut engine_seq, 1_000);
 
-    (engine, risk_state)
+    (engine, risk_state, engine_seq)
 }
 
 #[test]
 fn hot_path_allocates_nothing() {
-    let (mut engine, mut risk_state) = setup();
+    let (mut engine, mut risk_state, mut engine_seq) = setup();
 
+    // Snapshot is deliberately excluded from this measured sequence:
+    // it's an operator-invoked inspection command, not client-invoked
+    // order flow, and its own allocation is accepted, not held to this
+    // hot-path standard (see Book::snapshot's doc comment). Adding it
+    // here would fail for a reason that isn't a hot-path regression.
     let info = allocation_counter::measure(|| {
-        run_sequence(&mut engine, &mut risk_state, 2_000);
+        run_sequence(&mut engine, &mut risk_state, &mut engine_seq, 2_000);
     });
 
     assert_eq!(
@@ -358,6 +392,7 @@ const CHURN_BASE_PRICE: u64 = 5_000;
 fn level_churn_allocation_is_bounded() {
     let mut engine = Engine::new();
     let mut risk_state = RiskState::new(RiskConfig::default());
+    let mut engine_seq = EngineSeq(0);
 
     // Pre-warm every account this test uses -- account creation isn't
     // what's being measured here either; only level churn is.
@@ -365,11 +400,13 @@ fn level_churn_allocation_is_bounded() {
         apply(
             &mut engine,
             &mut risk_state,
+            &mut engine_seq,
             new_order(account, 1, Side::Buy, 1, 1, OrderKind::Limit, Tif::Gtc),
         );
         apply(
             &mut engine,
             &mut risk_state,
+            &mut engine_seq,
             Command::CancelOrder {
                 account_id: AccountId(account),
                 order_id: OrderId(1),
@@ -397,6 +434,7 @@ fn level_churn_allocation_is_bounded() {
             apply(
                 &mut engine,
                 &mut risk_state,
+                &mut engine_seq,
                 new_order(
                     account,
                     order_id,
@@ -416,6 +454,7 @@ fn level_churn_allocation_is_bounded() {
                 apply(
                     &mut engine,
                     &mut risk_state,
+                    &mut engine_seq,
                     Command::CancelOrder {
                         account_id: old_account,
                         order_id: old_order,

@@ -8,13 +8,13 @@ use crate::types::{OrderKind, Tif};
 
 /// Wraps `Book` behind the one call site SPEC §4 names: `Engine::apply`.
 ///
-/// `KillSwitch` and `Snapshot` are accepted here (so `apply` stays total
-/// over every `Command` variant, since all six travel the same channel
-/// from the gateway) but not yet acted on — kill-switch *state* belongs to
-/// `risk` (SPEC §4), checked by the matching thread *before* calling
-/// `apply`, not inside it; real handling lands with stage 4/marketdata's
-/// snapshot support. Applying either variant here is currently a no-op
-/// that emits nothing, not a guess at behaviour that isn't built yet.
+/// `KillSwitch` and `Snapshot` both travel the same channel as every other
+/// `Command` (so `apply` stays total over every variant), but only
+/// `Snapshot` does anything here: it dumps current book state
+/// (`Book::snapshot`). `KillSwitch` is a no-op in `Engine` — its *state*
+/// belongs to `risk` (SPEC §4), checked by the matching thread *before*
+/// `apply` is ever called, so there is nothing left for `Engine` itself to
+/// act on.
 #[derive(Debug, Default)]
 pub struct Engine {
     book: Book,
@@ -96,7 +96,11 @@ impl Engine {
                 .book
                 .modify(account_id, order_id, new_price, new_qty, emit),
             Command::MassCancel { account_id } => self.book.mass_cancel(account_id, emit),
-            Command::KillSwitch { .. } | Command::Snapshot => {}
+            Command::Snapshot => self.book.snapshot(emit),
+            // Kill-switch *state* belongs to risk (SPEC §4), checked
+            // before `apply` is ever called -- there is nothing left for
+            // `Engine` itself to do with it.
+            Command::KillSwitch { .. } => {}
         }
     }
 }
@@ -276,14 +280,79 @@ mod tests {
     }
 
     #[test]
-    fn apply_kill_switch_and_snapshot_are_inert_for_now() {
+    fn apply_kill_switch_is_inert_in_engine() {
+        // Kill-switch state lives in risk, checked before apply is ever
+        // called -- Engine itself has nothing to do with it.
         let mut engine = Engine::new();
         let mut events = Vec::new();
         engine.apply(Command::KillSwitch { engaged: true }, &mut |e| {
             events.push(e)
         });
-        engine.apply(Command::Snapshot, &mut |e| events.push(e));
         assert!(events.is_empty());
+        engine.book().assert_invariants();
+    }
+
+    #[test]
+    fn apply_snapshot_on_an_empty_book_emits_only_the_summary_trailer() {
+        let mut engine = Engine::new();
+        let mut events = Vec::new();
+        engine.apply(Command::Snapshot, &mut |e| events.push(e));
+        assert_eq!(
+            events,
+            vec![Event::SnapshotSummary {
+                best_bid: None,
+                best_ask: None,
+                last_trade: None,
+                level_count: 0,
+                account_count: 0,
+            }]
+        );
+        engine.book().assert_invariants();
+    }
+
+    #[test]
+    fn apply_snapshot_reflects_resting_state_and_never_emits_book_update() {
+        let mut engine = Engine::new();
+        engine.apply(
+            Command::NewOrder {
+                account_id: AccountId(1),
+                order_id: OrderId(1),
+                side: Side::Buy,
+                price: Price(100),
+                qty: Qty(5),
+                kind: OrderKind::Limit,
+                tif: Tif::Gtc,
+                client_ts: 0,
+            },
+            &mut |_| {},
+        );
+
+        let mut events = Vec::new();
+        engine.apply(Command::Snapshot, &mut |e| events.push(e));
+        assert_eq!(
+            events,
+            vec![
+                Event::SnapshotLevel {
+                    side: Side::Buy,
+                    price: Price(100),
+                    qty: Qty(5),
+                    order_count: 1,
+                },
+                Event::SnapshotAccount {
+                    account_id: AccountId(1),
+                    open_order_count: 1,
+                    notional: 500,
+                },
+                Event::SnapshotSummary {
+                    best_bid: Some((Price(100), Qty(5))),
+                    best_ask: None,
+                    last_trade: None,
+                    level_count: 1,
+                    account_count: 1,
+                },
+            ],
+            "Snapshot is read-only -- it must never itself trigger a BookUpdate"
+        );
         engine.book().assert_invariants();
     }
 }

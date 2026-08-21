@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use core::event::{Command, Event};
-use core::types::{AccountId, OrderId, OrderKind, Price, Qty, Side, StreamSeq, Tif};
+use core::types::{AccountId, EngineSeq, OrderId, OrderKind, Price, Qty, Side, StreamSeq, Tif};
 
 fn temp_socket_path(label: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -90,7 +90,7 @@ fn send_cancel(client: &mut UnixStream, account_id: u64, order_id: u64) {
 
 /// Reads exactly one frame and decodes it -- the tag byte determines the
 /// rest of the length (SPEC §3).
-fn read_one(stream: &mut UnixStream) -> (StreamSeq, Event) {
+fn read_one(stream: &mut UnixStream) -> (StreamSeq, Option<EngineSeq>, Event) {
     let mut tag_buf = [0u8; 1];
     stream
         .read_exact(&mut tag_buf)
@@ -138,7 +138,7 @@ fn slow_subscriber_does_not_cause_the_fast_subscriber_to_lose_messages() {
     // regardless of what the slow one is doing.
     let mut seqs = Vec::new();
     for _ in 0..(2 * N) {
-        let (seq, _event) = read_one(&mut fast);
+        let (seq, _engine_seq, _event) = read_one(&mut fast);
         seqs.push(seq.0);
     }
     let expected: Vec<u64> = (1..=2 * N).collect();
@@ -163,7 +163,7 @@ fn execution_report_only_burst_does_not_advance_market_data_stream_seq() {
     // the book at all.
     for i in 0..10 {
         send_cancel(&mut client, 1, i);
-        let (_seq, event) = read_one(&mut client);
+        let (_seq, _engine_seq, event) = read_one(&mut client);
         assert!(matches!(event, Event::Rejected { .. }));
     }
 
@@ -187,7 +187,7 @@ fn execution_report_only_burst_does_not_advance_market_data_stream_seq() {
     subscriber
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    let (seq, event) = read_one(&mut subscriber);
+    let (seq, _engine_seq, event) = read_one(&mut subscriber);
     assert_eq!(seq, StreamSeq(1));
     assert!(matches!(event, Event::BookUpdate { .. }));
 }
@@ -247,12 +247,12 @@ fn slow_market_data_subscriber_does_not_stall_matching_or_order_entry() {
         // path was never stalled by the market-data side (order entry
         // progressed) -- the entire reason market data has its own
         // thread and socket (SPEC §4).
-        let (_seq, event) = read_one(&mut taker);
+        let (_seq, _engine_seq, event) = read_one(&mut taker);
         assert!(
             matches!(event, Event::Filled { .. }),
             "matching thread must keep matching orders"
         );
-        let (_seq, event) = read_one(&mut taker);
+        let (_seq, _engine_seq, event) = read_one(&mut taker);
         assert!(matches!(event, Event::Accepted { .. }));
     }
     let elapsed = start.elapsed();
@@ -275,13 +275,13 @@ fn both_streams_have_independently_monotonic_sequence_numbers() {
     let mut execution_seqs = Vec::new();
     for i in 0..N {
         send_new_order(&mut client, 1, i, Side::Buy, 100 + i, 1);
-        let (seq, _event) = read_one(&mut client); // Accepted
+        let (seq, _engine_seq, _event) = read_one(&mut client); // Accepted
         execution_seqs.push(seq.0);
     }
 
     let mut market_data_seqs = Vec::new();
     for _ in 0..N {
-        let (seq, _event) = read_one(&mut subscriber); // BookUpdate, one per new best bid
+        let (seq, _engine_seq, _event) = read_one(&mut subscriber); // BookUpdate, one per new best bid
         market_data_seqs.push(seq.0);
     }
 

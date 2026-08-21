@@ -18,6 +18,9 @@ pub const TAG_CANCELLED: u8 = 13;
 pub const TAG_REPLACED: u8 = 14;
 pub const TAG_TRADE: u8 = 15;
 pub const TAG_BOOK_UPDATE: u8 = 16;
+pub const TAG_SNAPSHOT_LEVEL: u8 = 17;
+pub const TAG_SNAPSHOT_ACCOUNT: u8 = 18;
+pub const TAG_SNAPSHOT_SUMMARY: u8 = 19;
 
 // Inbound. Layout: byte 0 tag, then fixed-width fields in the order listed.
 /// `NewOrder`: order_id(8) account_id(8) side(1) price(8) qty(8) order_kind(1) tif(1) client_ts(8)
@@ -39,24 +42,41 @@ pub const SNAPSHOT_LEN: usize = 1;
 // §8), even though `core::Event` itself carries no seq field (core doesn't
 // know about streams; the caller supplies the seq for the stream it's
 // encoding onto).
-/// `Accepted`: stream_seq(8) account_id(8) order_id(8) resting_qty(8)
-pub const ACCEPTED_LEN: usize = 33;
-/// `Rejected`: stream_seq(8) account_id(8) order_id(8) reason(1)
-pub const REJECTED_LEN: usize = 26;
-/// `Filled`: stream_seq(8) account_id(8) order_id(8) side(1) price(8) qty(8) resting_qty(8)
-pub const FILLED_LEN: usize = 50;
-/// `Cancelled`: stream_seq(8) account_id(8) order_id(8)
-pub const CANCELLED_LEN: usize = 25;
-/// `Replaced`: stream_seq(8) account_id(8) order_id(8) new_qty(8) priority_retained(1)
-pub const REPLACED_LEN: usize = 34;
+//
+// `engine_seq(8)` follows `stream_seq` on the five execution-report types
+// only (`Accepted`/`Rejected`/`Filled`/`Cancelled`/`Replaced`) -- not
+// `Trade`/`BookUpdate`/the three `Snapshot*` types. `EngineSeq` is
+// externally tracked too (`risk::process_command`, not `core::Event` --
+// SPEC §2), counting every command the *system* processes, including one
+// risk-rejected before ever reaching `Engine::apply`; it is not the same
+// counter as any stream's `StreamSeq`, and it is not on the wire at all
+// for the message types that don't carry it.
+/// `Accepted`: stream_seq(8) engine_seq(8) account_id(8) order_id(8) resting_qty(8)
+pub const ACCEPTED_LEN: usize = 41;
+/// `Rejected`: stream_seq(8) engine_seq(8) account_id(8) order_id(8) reason(1)
+pub const REJECTED_LEN: usize = 34;
+/// `Filled`: stream_seq(8) engine_seq(8) account_id(8) order_id(8) side(1) price(8) qty(8) resting_qty(8) state(1)
+pub const FILLED_LEN: usize = 59;
+/// `Cancelled`: stream_seq(8) engine_seq(8) account_id(8) order_id(8)
+pub const CANCELLED_LEN: usize = 33;
+/// `Replaced`: stream_seq(8) engine_seq(8) account_id(8) order_id(8) new_qty(8) priority_retained(1)
+pub const REPLACED_LEN: usize = 42;
 /// `Trade`: stream_seq(8) price(8) qty(8) taker_side(1)
 pub const TRADE_LEN: usize = 26;
 /// `BookUpdate`: stream_seq(8) bid_present(1) bid_price(8) bid_qty(8) ask_present(1) ask_price(8) ask_qty(8)
 pub const BOOK_UPDATE_LEN: usize = 43;
+/// `SnapshotLevel`: stream_seq(8) side(1) price(8) qty(8) order_count(8)
+pub const SNAPSHOT_LEVEL_LEN: usize = 34;
+/// `SnapshotAccount`: stream_seq(8) account_id(8) open_order_count(8) notional(16, u128)
+pub const SNAPSHOT_ACCOUNT_LEN: usize = 41;
+/// `SnapshotSummary`: stream_seq(8) bid_present(1) bid_price(8) bid_qty(8)
+/// ask_present(1) ask_price(8) ask_qty(8) last_trade_present(1)
+/// last_trade_price(8) level_count(8) account_count(8)
+pub const SNAPSHOT_SUMMARY_LEN: usize = 68;
 
 /// The largest fixed length any message type can have — sizing guidance
 /// for a caller-owned scratch buffer, not a runtime bound.
-pub const MAX_MESSAGE_LEN: usize = FILLED_LEN;
+pub const MAX_MESSAGE_LEN: usize = SNAPSHOT_SUMMARY_LEN;
 
 /// The total byte length implied by a tag, or `None` if the tag is
 /// unrecognized. The framer uses this to know how many bytes a message
@@ -76,6 +96,9 @@ pub fn message_len(tag: u8) -> Option<usize> {
         TAG_REPLACED => Some(REPLACED_LEN),
         TAG_TRADE => Some(TRADE_LEN),
         TAG_BOOK_UPDATE => Some(BOOK_UPDATE_LEN),
+        TAG_SNAPSHOT_LEVEL => Some(SNAPSHOT_LEVEL_LEN),
+        TAG_SNAPSHOT_ACCOUNT => Some(SNAPSHOT_ACCOUNT_LEN),
+        TAG_SNAPSHOT_SUMMARY => Some(SNAPSHOT_SUMMARY_LEN),
         _ => None,
     }
 }

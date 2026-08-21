@@ -13,11 +13,22 @@ use crate::arena::{Arena, NULL, Node};
 use crate::error::RejectReason;
 use crate::event::Event;
 use crate::level::Level;
-use crate::types::{AccountId, OrderId, Price, Qty, Side};
+use crate::types::{AccountId, FillState, OrderId, Price, Qty, Side};
 
 /// One side of a top-of-book snapshot: the best price and the total
 /// resting quantity there, or `None` if that side is empty.
 pub type TouchSide = Option<(Price, Qty)>;
+
+/// `Filled.state` is a pure function of the fill's own `resting_qty`
+/// (SPEC §3) — computed once, here, rather than inline at each of
+/// `sweep`'s two `Filled` construction sites, so the two can't drift.
+fn fill_state(resting_qty: Qty) -> FillState {
+    if resting_qty.0 == 0 {
+        FillState::Filled
+    } else {
+        FillState::PartiallyFilled
+    }
+}
 
 /// The single-symbol order book: two price maps, the resting-order arena,
 /// and the indexes that make cancel, modify, and per-account risk checks
@@ -381,14 +392,17 @@ impl Book {
                     price: fill_price,
                     qty: Qty(fill_qty),
                     resting_qty: Qty(remaining),
+                    state: fill_state(Qty(remaining)),
                 });
+                let maker_resting_qty = maker.qty.0 - fill_qty;
                 emit(Event::Filled {
                     account_id: maker.account,
                     order_id: maker.id,
                     side: opposite_side,
                     price: fill_price,
                     qty: Qty(fill_qty),
-                    resting_qty: Qty(maker.qty.0 - fill_qty),
+                    resting_qty: Qty(maker_resting_qty),
+                    state: fill_state(Qty(maker_resting_qty)),
                 });
                 emit(Event::Trade {
                     price: fill_price,
@@ -913,6 +927,86 @@ impl Book {
         }
     }
 
+    /// Dumps current book state for inspection (SPEC §3's `Snapshot`
+    /// command): per-side, per-price-level resting quantity and order
+    /// count; best bid/ask; `last_trade`; and per-account open-order count
+    /// and notional. Read-only -- never mutates, never rejected by risk,
+    /// inert under the kill switch's drain (SPEC §5).
+    ///
+    /// Reuses `assert_invariants()`'s own traversal shape (`for (&price,
+    /// level) in &self.bids` then `&self.asks`, the same deterministic
+    /// `BTreeMap` order, then `walk_level` to discover each level's
+    /// individual orders) rather than a second walker. `self.accounts` (a
+    /// `HashMap`) is never iterated directly -- the per-account section
+    /// below is ordered by first appearance during this same level walk,
+    /// with a `HashSet` used only for membership checking, never for
+    /// output order, so no `HashMap` iteration order reaches the wire
+    /// (CLAUDE.md).
+    ///
+    /// This performs one allocating pass over the book (the account-
+    /// tracking `Vec`/`HashSet`) every time it's called, unlike
+    /// `submit`/`cancel`/`modify`, and that's accepted, not a gap:
+    /// `Snapshot` is an operator-invoked inspection command, not
+    /// client-invoked order flow, so it isn't held to the zero-allocation
+    /// hot-path standard that flow is (SPEC §6/§9) -- what makes
+    /// something "hot path" here is whether it's on the per-order flow,
+    /// not whether it happens to run on the matching thread. The
+    /// allocation is bounded by the size of the book at the moment it's
+    /// called, the same way `mass_cancel`'s now-fixed clone was bounded by
+    /// one account's resting-order count -- but `mass_cancel` is ordinary
+    /// client order flow, and `Snapshot` is not, which is the actual line
+    /// (see `hot_path_allocates_nothing`, `crates/risk/tests/zero_alloc.rs`,
+    /// which deliberately excludes `Snapshot` from its measured sequence
+    /// for exactly this reason).
+    pub fn snapshot(&self, emit: &mut dyn FnMut(Event)) {
+        let mut accounts_seen: HashSet<AccountId> = HashSet::new();
+        let mut accounts_order: Vec<AccountId> = Vec::new();
+        let mut level_count: u64 = 0;
+
+        for (side, map) in [(Side::Buy, &self.bids), (Side::Sell, &self.asks)] {
+            for (&price, level) in map {
+                emit(Event::SnapshotLevel {
+                    side,
+                    price,
+                    qty: level.total_qty(),
+                    order_count: u64::from(level.count()),
+                });
+                level_count += 1;
+
+                for slot in self.walk_level(side, price, level) {
+                    let node = self
+                        .arena
+                        .get(slot)
+                        .expect("slot just returned by walk_level must be live");
+                    if accounts_seen.insert(node.account) {
+                        accounts_order.push(node.account);
+                    }
+                }
+            }
+        }
+
+        for account_id in &accounts_order {
+            let entry = self
+                .accounts
+                .get(account_id)
+                .expect("account discovered via a resting order must have an AccountEntry");
+            emit(Event::SnapshotAccount {
+                account_id: *account_id,
+                open_order_count: entry.open_order_count() as u64,
+                notional: entry.notional(),
+            });
+        }
+
+        let (best_bid, best_ask) = self.top_of_book();
+        emit(Event::SnapshotSummary {
+            best_bid,
+            best_ask,
+            last_trade: self.last_trade,
+            level_count,
+            account_count: accounts_order.len() as u64,
+        });
+    }
+
     /// Walk one level's chain from head to tail, checking link consistency,
     /// tail reachability, node/map-key agreement, non-zero qty/price, and
     /// the cached `total_qty`/`count` along the way. Returns the slots
@@ -1422,6 +1516,7 @@ mod tests {
                     price: Price(100),
                     qty: Qty(2),
                     resting_qty: Qty(3),
+                    state: FillState::PartiallyFilled,
                 },
                 Event::Filled {
                     account_id: AccountId(1),
@@ -1430,6 +1525,7 @@ mod tests {
                     price: Price(100),
                     qty: Qty(2),
                     resting_qty: Qty(0),
+                    state: FillState::Filled,
                 },
                 Event::Trade {
                     price: Price(100),
@@ -1443,6 +1539,7 @@ mod tests {
                     price: Price(100),
                     qty: Qty(2),
                     resting_qty: Qty(1),
+                    state: FillState::PartiallyFilled,
                 },
                 Event::Filled {
                     account_id: AccountId(2),
@@ -1451,6 +1548,7 @@ mod tests {
                     price: Price(100),
                     qty: Qty(2),
                     resting_qty: Qty(0),
+                    state: FillState::Filled,
                 },
                 Event::Trade {
                     price: Price(100),
@@ -1464,6 +1562,7 @@ mod tests {
                     price: Price(100),
                     qty: Qty(1),
                     resting_qty: Qty(0),
+                    state: FillState::Filled,
                 },
                 Event::Filled {
                     account_id: AccountId(3),
@@ -1472,6 +1571,7 @@ mod tests {
                     price: Price(100),
                     qty: Qty(1),
                     resting_qty: Qty(1),
+                    state: FillState::PartiallyFilled,
                 },
                 Event::Trade {
                     price: Price(100),
@@ -1518,6 +1618,7 @@ mod tests {
                     price: Price(100),
                     qty: Qty(3),
                     resting_qty: Qty(0),
+                    state: FillState::Filled,
                 },
                 &Event::Filled {
                     account_id: AccountId(2),
@@ -1526,6 +1627,7 @@ mod tests {
                     price: Price(101),
                     qty: Qty(3),
                     resting_qty: Qty(0),
+                    state: FillState::Filled,
                 },
                 &Event::Filled {
                     account_id: AccountId(3),
@@ -1534,6 +1636,7 @@ mod tests {
                     price: Price(102),
                     qty: Qty(1),
                     resting_qty: Qty(2),
+                    state: FillState::PartiallyFilled,
                 },
             ]
         );
@@ -2047,6 +2150,7 @@ mod tests {
                     price: Price(100),
                     qty: Qty(4),
                     resting_qty: Qty(0),
+                    state: FillState::Filled,
                 },
                 Event::Filled {
                     account_id: AccountId(2),
@@ -2055,6 +2159,7 @@ mod tests {
                     price: Price(100),
                     qty: Qty(4),
                     resting_qty: Qty(0),
+                    state: FillState::Filled,
                 },
                 Event::Trade {
                     price: Price(100),
@@ -2090,6 +2195,7 @@ mod tests {
                     price: Price(100),
                     qty: Qty(3),
                     resting_qty: Qty(7),
+                    state: FillState::PartiallyFilled,
                 },
                 Event::Filled {
                     account_id: AccountId(1),
@@ -2098,6 +2204,7 @@ mod tests {
                     price: Price(100),
                     qty: Qty(3),
                     resting_qty: Qty(0),
+                    state: FillState::Filled,
                 },
                 Event::Trade {
                     price: Price(100),
@@ -2354,6 +2461,7 @@ mod tests {
                     price: Price(95),
                     qty: Qty(3),
                     resting_qty: Qty(2),
+                    state: FillState::PartiallyFilled,
                 },
                 Event::Filled {
                     account_id: AccountId(2),
@@ -2362,6 +2470,7 @@ mod tests {
                     price: Price(95),
                     qty: Qty(3),
                     resting_qty: Qty(0),
+                    state: FillState::Filled,
                 },
                 Event::Trade {
                     price: Price(95),
@@ -2474,6 +2583,7 @@ mod tests {
                     price: Price(100),
                     qty: Qty(4),
                     resting_qty: Qty(1),
+                    state: FillState::PartiallyFilled,
                 },
                 Event::Filled {
                     account_id: AccountId(2),
@@ -2482,6 +2592,7 @@ mod tests {
                     price: Price(100),
                     qty: Qty(4),
                     resting_qty: Qty(0),
+                    state: FillState::Filled,
                 },
                 Event::Trade {
                     price: Price(100),

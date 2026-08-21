@@ -9,7 +9,7 @@
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
-use core::types::StreamSeq;
+use core::types::{EngineSeq, StreamSeq};
 
 const DEFAULT_RISK_CONFIG_PATH: &str = "risk.toml";
 
@@ -72,13 +72,21 @@ fn write_output(output: &bin::ReplayOutput) {
         );
     }
     let mut out = stdout.lock();
-    for (seq, event) in output.execution_reports.iter().chain(&output.market_data) {
-        write_one(&mut out, *seq, event);
+    for (seq, engine_seq, event) in &output.execution_reports {
+        write_one(&mut out, *seq, Some(*engine_seq), event);
+    }
+    for (seq, event) in &output.market_data {
+        write_one(&mut out, *seq, None, event);
     }
 }
 
-fn write_one(out: &mut impl Write, seq: StreamSeq, event: &core::Event) {
+fn write_one(
+    out: &mut impl Write,
+    seq: StreamSeq,
+    engine_seq: Option<EngineSeq>,
+    event: &core::Event,
+) {
     let mut buf = [0u8; wire::MAX_MESSAGE_LEN];
-    let len = wire::encode_event(seq, event, &mut buf);
+    let len = wire::encode_event(seq, engine_seq, event, &mut buf);
     let _ = out.write_all(&buf[..len]);
 }

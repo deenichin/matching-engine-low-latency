@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use core::event::Event;
-use core::types::{Price, StreamSeq};
+use core::types::{EngineSeq, Price, StreamSeq};
 use core::{Command, Engine};
 use risk::{RiskConfig, RiskState};
 
@@ -27,7 +27,7 @@ use risk::{RiskConfig, RiskState};
 /// replay.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ReplayOutput {
-    pub execution_reports: Vec<(StreamSeq, Event)>,
+    pub execution_reports: Vec<(StreamSeq, EngineSeq, Event)>,
     pub market_data: Vec<(StreamSeq, Event)>,
     pub last_trade: Option<Price>,
 }
@@ -84,17 +84,28 @@ pub fn replay_file(
     let mut market_data = Vec::new();
     let mut exec_seq = 0u64;
     let mut md_seq = 0u64;
+    // Fresh per run, exactly like exec_seq/md_seq above -- and, crucially,
+    // incremented by the exact same function (risk::process_command) the
+    // live matching thread calls, so a replayed run's EngineSeq values
+    // cannot drift from a live run's by construction (SPEC §2).
+    let mut engine_seq = EngineSeq(0);
 
     for cmd in commands {
-        risk::process_command(&mut engine, &mut risk_state, cmd, &mut |event| {
-            if matches!(event, Event::Trade { .. } | Event::BookUpdate { .. }) {
-                md_seq += 1;
-                market_data.push((StreamSeq(md_seq), event));
-            } else {
-                exec_seq += 1;
-                execution_reports.push((StreamSeq(exec_seq), event));
-            }
-        });
+        risk::process_command(
+            &mut engine,
+            &mut risk_state,
+            cmd,
+            &mut engine_seq,
+            &mut |seq, event| {
+                if matches!(event, Event::Trade { .. } | Event::BookUpdate { .. }) {
+                    md_seq += 1;
+                    market_data.push((StreamSeq(md_seq), event));
+                } else {
+                    exec_seq += 1;
+                    execution_reports.push((StreamSeq(exec_seq), seq, event));
+                }
+            },
+        );
     }
 
     Ok(ReplayOutput {

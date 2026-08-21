@@ -9,5 +9,19 @@ services:
       #   /run/engine/market-data.sock
       - engine-sockets:/run/engine
 
+  # Same Dockerfile, targeting the `builder` stage directly -- that stage
+  # already has the full Rust toolchain and the workspace built, unlike
+  # `engine`'s final debian:bookworm-slim stage, which has no cargo/rustc
+  # at all. This is how a reviewer runs the test suite and both benchmark
+  # suites with no host Rust install (PLAN.md stage 8):
+  #   docker compose run --rm dev ./check.sh
+  #   docker compose run --rm dev cargo bench -p core
+  #   docker compose run --rm dev cargo run -p bench --release -- --messages 1000000
+  dev:
+    build:
+      context: .
+      target: builder
+    image: onebalance-task-dev:local
+
 volumes:
   engine-sockets:

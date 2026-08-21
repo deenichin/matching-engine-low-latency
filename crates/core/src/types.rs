@@ -90,6 +90,21 @@ pub enum Tif {
     PostOnly,
 }
 
+/// A fill's order-status distinction: whether the order it belongs to has
+/// any quantity left resting after this fill, or has been fully consumed.
+///
+/// Mirrors FIX's `ExecutionReport`/`OrdStatus` (tag 39) design — a status
+/// *field* on one execution message type, not a second message type. This
+/// protocol already collapses FIX's `ExecType` (tag 150) into the message
+/// tag itself (one tag per `core::Event` variant, ITCH/OUCH-style, SPEC
+/// §3); `state` recovers the `OrdStatus` distinction without reopening
+/// that collapse into a `PartiallyFilled` tag alongside `Filled`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FillState {
+    PartiallyFilled,
+    Filled,
+}
+
 /// Cents per price tick. `Price` is denominated in ticks; one tick is
 /// exactly one cent (SPEC §2).
 pub const TICK_SIZE_CENTS: u64 = 1;
